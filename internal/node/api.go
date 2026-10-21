@@ -76,6 +76,10 @@ func (n *Node) API(opts APIOptions) http.Handler {
 	mux.HandleFunc("GET /v1/contracts/{id}", n.apiContract)
 	mux.HandleFunc("GET /v1/contracts/{id}/storage/{key}", n.apiStorage)
 	mux.HandleFunc("POST /v1/storage", n.apiStorageBatch)
+	for _, p := range explorerPages {
+		mux.HandleFunc("GET "+p, n.explorerPage)
+	}
+	mux.HandleFunc("GET /assets/{name}", n.explorerAsset)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "endpoint not found"})
 	})

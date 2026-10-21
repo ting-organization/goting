@@ -155,6 +155,21 @@ before 16 MiB), error mapping and protections:
 Storage reads can carry Merkle proofs against the state root, in the
 reference's proof format.
 
+### Block explorer
+
+The same listener serves a block explorer at `/`, built into the binary. Its
+pages are:
+
+- the overview, with live height and block-time, throughput, hash-rate and
+  fullness charts;
+- blocks, block, transaction and program pages, and the mempool;
+- `/network`, for capacity voting and node health;
+- `/insights`, for work per block, transaction outcomes, block-time
+  distribution, the most active programs and resource demand.
+
+Program pages read storage with Merkle proofs and check them in the browser.
+The explorer uses only the `/v1` API and loads nothing from elsewhere.
+
 ### Running from flags
 
 ```bash

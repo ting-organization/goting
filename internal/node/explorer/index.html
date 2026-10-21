@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Ting explorer</title>
+<link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/style.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="/" data-link>
+      <img src="/assets/logo.svg" alt="" width="24" height="24">
+      <span class="brand-name">Ting</span><span class="brand-sub">explorer</span>
+    </a>
+    <nav class="nav" aria-label="Sections">
+      <a href="/" data-link data-nav="overview">Overview</a>
+      <a href="/blocks" data-link data-nav="blocks">Blocks</a>
+      <a href="/mempool" data-link data-nav="mempool">Mempool</a>
+      <a href="/network" data-link data-nav="network">Network</a>
+      <a href="/insights" data-link data-nav="insights">Insights</a>
+    </nav>
+    <form class="search" id="search" role="search">
+      <input id="q" type="search" placeholder="Height, block, transaction or contract id" aria-label="Search by height, block, transaction or contract id" autocomplete="off" spellcheck="false">
+    </form>
+    <div class="live" id="live" title="The page follows the node's tip">
+      <span class="live-dot" aria-hidden="true"></span><span id="live-height">connecting</span>
+    </div>
+    <button class="theme" id="theme" type="button" aria-label="Switch between light and dark">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+    </button>
+  </div>
+</header>
+<main id="main" tabindex="-1"><div class="loading">Loading</div></main>
+<footer class="foot">
+  <div class="foot-inner">
+    <span id="foot-node">Ting node</span>
+    <span class="sep">·</span><a href="/v1/status">REST API</a>
+    <span class="sep">·</span><a href="https://github.com/ting-organization/goting">goting</a>
+  </div>
+</footer>
+<div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

@@ -623,7 +623,8 @@ None of these affects which blocks are valid.
 | State storage | redb database with records, tree nodes and per-block undo/redo; every block committed; undo pruned to `undo_window` | bbolt database with records, tree nodes and undo data (no redo); the base trails the tip by 128–256 blocks and moves in one commit; undo kept for `undo_window` blocks below the base (43,200; 0 keeps all); `db_cache_mib` accepted but unused, the operating system's page cache serving instead |
 | Header index | held headers above a settled height; older ones in the database | every header in memory, restored from the database's block rows at start |
 | Deep reorganizations | below the undo window, replay from genesis in the background | below the undo window, refused |
-| Explorer, wiki, Swagger UI, `/openapi.json`, `ting docs` | served | not served |
+| Explorer | served at `/`, `/blocks`, `/blocks/{id}`, `/transactions/{id}`, `/contracts/{id}`, `/mempool` | its own explorer at the same paths, plus `/network` and `/insights` |
+| Wiki, Swagger UI, `/openapi.json`, `ting docs` | served | not served |
 | Status | published every 0.2 s; `/health` answers 504 when that is older than 30 s | computed per request; `settled_height` is the database's base |
 | Pluggable selection and nonce search | Rust traits a mining fork replaces | fixed (FirstIn turns, CPU search) |
 
