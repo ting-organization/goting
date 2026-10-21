@@ -14,14 +14,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/ting-organization/goting/internal/types"
 )
 
 // Config is config.json, with the reference node's fields and defaults.
-// Unknown fields are refused. undo_window and db_cache_mib are accepted for
-// compatibility; this node keeps state in memory and has no undo data.
+// Unknown fields are refused. db_cache_mib is accepted for compatibility:
+// this node's database relies on the operating system's page cache.
 type Config struct {
 	Version    uint32           `json:"version"`
 	Name       string           `json:"name"`
@@ -170,7 +169,7 @@ func Lock(dir string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := lockFile(f); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("data directory is locked: %v", err)
 	}

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/ting-organization/goting/internal/chain"
+	"github.com/ting-organization/goting/internal/db"
 	"github.com/ting-organization/goting/internal/hashing"
 	"github.com/ting-organization/goting/internal/node"
 	"github.com/ting-organization/goting/internal/seed"
@@ -336,7 +337,6 @@ func cmdNode(args []string) error {
 	seedBundle := fs.String("seed-bundle", "", "seed bundle to connect at start")
 	seedList := fs.String("seed-list", "", "seed list pinned for the seed heights")
 	trust := fs.Bool("trust-bundle", false, "pin the seed bundle's own BlockIds (testing only)")
-	snapEvery := fs.Uint64("snapshot-every", 1000, "write a state snapshot every N blocks (needs -data; 0: never)")
 	interval := fs.Duration("interval", 0, "least time between blocks this node mines (0: as fast as the target allows)")
 	peersFlag := fs.String("peers", "", "comma-separated configured peers, always kept connected")
 	listen := fs.String("listen", "", "peer protocol listen address, such as :18442 (empty: no inbound peers)")
@@ -364,11 +364,16 @@ func cmdNode(args []string) error {
 		}
 	}
 	var store chain.BlockStore = chain.NewMemStore()
+	var database *db.DB
 	if *data != "" {
 		if err := os.MkdirAll(*data, 0o755); err != nil {
 			return err
 		}
-		fsStore, err := chain.OpenFileStore(filepath.Join(*data, "blocks"), g.ChainID())
+		if database, err = db.Open(filepath.Join(*data, "chain.db"), g.ChainID()); err != nil {
+			return err
+		}
+		defer database.Close()
+		fsStore, err := chain.OpenStoredBlocks(filepath.Join(*data, "blocks"), g.ChainID(), database)
 		if err != nil {
 			return err
 		}
@@ -378,35 +383,31 @@ func cmdNode(args []string) error {
 	if pin := seedPin(g); pin != nil && len(ids) == 0 {
 		ids = chain.SeedFromStore(store, types.GenesisBlockID(g.ChainID()), pin.ID, pin.Height)
 	}
-	ccfg := chain.DefaultConfig()
-	if *data != "" {
-		ccfg.MarksPath = filepath.Join(*data, "marks.json")
-	}
-	c, err := chain.New(g, ids, store, ccfg)
-	if err != nil {
-		return err
-	}
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
 		return err
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
-	start := time.Now()
-	var n int
-	snapPath := ""
-	if *data != "" {
-		snapPath = filepath.Join(*data, "state.snap")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var fatal atomic.Pointer[error]
+	setFatal := func(err error) {
+		fatal.CompareAndSwap(nil, &err)
+		stop()
 	}
-	if snapPath != "" && fileExists(snapPath) {
-		info, st, err := state.ReadSnapshot(snapPath)
-		if err != nil {
-			return fmt.Errorf("reading %s: %w", snapPath, err)
-		}
-		log.Info("state snapshot", "height", info.Height, "records", info.Count)
-		if n, err = c.LoadFromSnapshot(info, st); err != nil {
-			return err
-		}
-	} else if n, err = c.Load(); err != nil {
+	ccfg := chain.DefaultConfig()
+	if *data != "" {
+		ccfg.MarksPath = filepath.Join(*data, "marks.json")
+		ccfg.State = database
+		ccfg.Fatal = setFatal
+	}
+	c, err := chain.New(g, ids, store, ccfg)
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	n, err := c.Load()
+	if err != nil {
 		return err
 	}
 	if n > 0 {
@@ -428,16 +429,9 @@ func cmdNode(args []string) error {
 		deferredPath = filepath.Join(*data, "deferred.json")
 	}
 	nd := node.New(c, node.Config{Name: *name, Mine: *mine, Producer: []byte(*producer), Votes: v, Workers: *workers,
-		SnapshotPath: snapPath, SnapshotEvery: *snapEvery, SnapshotDepth: 64, Interval: *interval,
-		DeferredPath: deferredPath}, log)
+		Interval: *interval, DeferredPath: deferredPath}, log)
 	nd.IndexCanonical()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	var fatal atomic.Pointer[error]
-	nd.Fatal = func(err error) {
-		fatal.CompareAndSwap(nil, &err)
-		stop()
-	}
+	nd.Fatal = setFatal
 	if *addr != "" {
 		srv := &http.Server{Addr: *addr, Handler: nd.API(node.APIOptions{CORS: *cors}), ReadHeaderTimeout: 10 * time.Second}
 		go func() {
@@ -485,6 +479,9 @@ func cmdNode(args []string) error {
 	log.Info("node running", "chain_id", c.ChainID().String(), "height", c.Tip().Height, "mine", *mine,
 		"peers", connect, "listen", *listen)
 	nd.Run(ctx)
+	if err := c.Settle(); err != nil {
+		log.Error("settling the state", "err", err)
+	}
 	if p := fatal.Load(); p != nil {
 		return *p
 	}

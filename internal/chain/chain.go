@@ -27,6 +27,7 @@ import (
 
 	"github.com/ting-organization/goting/internal/commit"
 	"github.com/ting-organization/goting/internal/consensus"
+	"github.com/ting-organization/goting/internal/db"
 	"github.com/ting-organization/goting/internal/exec"
 	"github.com/ting-organization/goting/internal/hashing"
 	"github.com/ting-organization/goting/internal/state"
@@ -68,6 +69,9 @@ type Entry struct {
 	children []*Entry
 	complete bool        // has data, as do all ancestors down to an executed one
 	state    *state.Tree // after this block; nil when not retained
+	// changes are the block's net record writes, kept with a database while
+	// the block is above the base: what flushing and rebasing replay.
+	changes []state.Change
 }
 
 // HasData reports whether the block's body is stored.
@@ -94,11 +98,20 @@ type Config struct {
 	MarksPath string
 	// Clock returns the time for the clock checks; time.Now when nil.
 	Clock func() time.Time
+	// State keeps the state in a database (see stored.go). Without one the
+	// whole state is in memory.
+	State *db.DB
+	// UndoWindow is how many blocks below the database's base keep undo
+	// data.
+	UndoWindow uint64
+	// Fatal is told of a failure of the node's own storage, after which the
+	// chain processes no more blocks.
+	Fatal func(error)
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
-	return Config{RetainDepth: 128, CheckpointInterval: 1000, CodeCacheBytes: 256 << 20}
+	return Config{RetainDepth: 128, CheckpointInterval: 1000, CodeCacheBytes: 256 << 20, UndoWindow: DefaultUndoWindow}
 }
 
 // Event reports a tip change to subscribers.
@@ -188,6 +201,13 @@ type Chain struct {
 
 	failedWork *big.Int // the most work of a branch that failed here
 	reorg      *Reorganization
+
+	base   *Entry // the block whose state the database holds; nil without one
+	broken error  // a storage failure: nothing more is processed
+	cursor Cursor // the block files' position up to which the database lists blocks
+	// rewinds counts rewinds of the base: a state derived across one is
+	// not kept.
+	rewinds uint64
 }
 
 // NoSeed, passed as a seed list, makes a private chain with no seed heights
@@ -252,6 +272,12 @@ func New(g *types.GenesisConfig, seed []hashing.Hash, store BlockStore, cfg Conf
 	}
 	if err := c.loadMarks(); err != nil {
 		return nil, err
+	}
+	if cfg.State != nil {
+		c.base = gen
+		if c.cfg.UndoWindow == 0 {
+			c.cfg.UndoWindow = DefaultUndoWindow
+		}
 	}
 	return c, nil
 }
@@ -602,6 +628,9 @@ func (c *Chain) Offenders() []string {
 func (c *Chain) ProcessBlockFrom(raw []byte, peer string) (*Entry, error) {
 	c.processMu.Lock()
 	defer c.processMu.Unlock()
+	if c.broken != nil {
+		return nil, c.broken
+	}
 	e, known, err := c.acceptBlock(raw, false)
 	if err != nil {
 		return e, err
@@ -811,7 +840,7 @@ func (c *Chain) activate() error {
 		tip := c.tip
 		c.mu.RUnlock()
 		if head == nil || head == tip {
-			return nil
+			return c.maybeFlush()
 		}
 		valid, err := c.connect(head)
 		if err != nil {
@@ -836,7 +865,18 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 	if len(branch) == 0 {
 		return true, nil
 	}
-	st, err := c.stateAt(branch[len(branch)-1].Parent)
+	fork := branch[len(branch)-1].Parent
+	st, err := c.stateAt(fork)
+	if errors.Is(err, ErrBelowBase) {
+		// The branch forks below the database's base: rewind it first.
+		c.mu.RLock()
+		to := commonAncestor(fork, c.base)
+		c.mu.RUnlock()
+		if err := c.rewind(to); err != nil {
+			return false, c.storageFail(err)
+		}
+		st, err = c.stateAt(fork)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -878,6 +918,9 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 		c.mu.Lock()
 		b.Status = StatusValid
 		b.state = &s
+		if c.cfg.State != nil {
+			b.changes = res.Changes
+		}
 		c.retained[b] = struct{}{}
 		delete(c.delivered, b.ID)
 		c.mu.Unlock()
@@ -937,6 +980,9 @@ func (c *Chain) publish(ev *Event) {
 // pruneStates drops states far below the tip, keeping canonical
 // checkpoints. Called with c.mu held.
 func (c *Chain) pruneStates() {
+	if c.cfg.State != nil {
+		return // the states above the base stay until it moves (stored.go)
+	}
 	if c.cfg.RetainDepth == 0 || c.tip.Height <= c.cfg.RetainDepth {
 		return
 	}
@@ -976,12 +1022,18 @@ func (c *Chain) stateAt(e *Entry) (state.Tree, error) {
 	}
 	var path []*Entry
 	n := e
+	rewinds := c.rewinds
 	for n.state == nil {
+		if c.base != nil && n.Height <= c.base.Height {
+			c.mu.RUnlock()
+			return state.Tree{}, ErrBelowBase
+		}
 		path = append(path, n)
 		n = n.Parent
 	}
 	st := *n.state
 	c.mu.RUnlock()
+	var changes []state.Change
 	for i := len(path) - 1; i >= 0; i-- {
 		b := path[i]
 		raw, err := c.store.Get(b.ID)
@@ -996,13 +1048,19 @@ func (c *Chain) stateAt(e *Entry) (state.Tree, error) {
 		if err != nil {
 			return state.Tree{}, fmt.Errorf("re-executing stored block %s: %w", b.ID, err)
 		}
-		st = res.State
+		st, changes = res.State, res.Changes
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rewinds != rewinds || e.Status != StatusValid {
+		return st, nil // the base moved back meanwhile: not kept
+	}
 	s := st
 	e.state = &s
+	if c.cfg.State != nil {
+		e.changes = changes
+	}
 	c.retained[e] = struct{}{}
-	c.mu.Unlock()
 	return st, nil
 }
 
@@ -1045,9 +1103,19 @@ func (c *Chain) NewBuilder(parent *Entry, ctx *vm.BlockContext, limits types.Res
 func (c *Chain) Load() (int, error) {
 	c.processMu.Lock()
 	defer c.processMu.Unlock()
+	if c.cfg.State != nil {
+		if err := c.restoreRows(); err != nil {
+			return 0, err
+		}
+	}
 	n, err := c.indexStored()
 	if err != nil {
 		return n, err
+	}
+	if c.cfg.State != nil {
+		if err := c.loadBase(); err != nil {
+			return n, err
+		}
 	}
 	return n, c.activate()
 }

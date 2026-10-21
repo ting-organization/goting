@@ -78,7 +78,7 @@ func preparationPrice(mod *wasm.Module) uint64 {
 func newMachine(x *TxExec, act *activation, mod *wasm.Module) *Machine {
 	m := &Machine{x: x, act: act, mod: mod}
 	if mod.HasMemory {
-		m.mem = make([]byte, uint64(mod.MemMin)*wasm.PageSize)
+		m.mem = getMemory(uint64(mod.MemMin) * wasm.PageSize)
 		for _, d := range mod.Data {
 			copy(m.mem[d.Offset:], d.Bytes)
 		}
@@ -184,7 +184,7 @@ func (m *Machine) grow(delta uint32) (uint32, uint8) {
 	if st := m.x.meter.DebitC(&m.act.limit, PagePrice*uint64(delta)); st != DebitOK {
 		return 0, st
 	}
-	m.mem = append(m.mem, make([]byte, uint64(delta)*wasm.PageSize)...)
+	m.mem = growMemory(m.mem, uint64(old+delta)*wasm.PageSize)
 	m.pages = old + delta
 	m.price = PriceFor(m.pages)
 	return old, DebitOK

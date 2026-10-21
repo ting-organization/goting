@@ -241,7 +241,10 @@ func (c *Chain) executeBody(parentState state.Tree, h *types.Header, id hashing.
 			return nil, diffReceipt(h.Height, i, r, got, body.Receipts[i])
 		}
 	}
-	res := b.Finish()
+	res, err := b.Finish()
+	if err != nil {
+		return nil, err
+	}
 	if res.Used != h.ResourcesUsed {
 		return nil, invalid(h, id, "resources used %v, header declares %v", res.Used, h.ResourcesUsed)
 	}

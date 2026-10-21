@@ -559,6 +559,7 @@ func (n *Node) tick() error {
 // block had taken come back; other transactions of disconnected blocks are
 // offered again as the node's own. Runs synchronously for every tip change.
 func (n *Node) published(ev chain.Event) {
+	n.pruneIndex()
 	for _, e := range ev.Removed {
 		n.index(e, false)
 	}

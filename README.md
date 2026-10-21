@@ -26,8 +26,8 @@ Findings, open questions and the remaining differences are logged in
 
 ## Build and test
 
-Requires Go 1.24 or newer. There are no dependencies outside the standard
-library.
+Requires Go 1.25 or newer. The one dependency outside the standard library is
+the bbolt embedded database (`go.etcd.io/bbolt`); the build is pure Go.
 
 ```bash
 go install github.com/ting-organization/goting/cmd/ting@latest
@@ -190,7 +190,7 @@ This is useful for tests and scripts.
 | `runtime.json` | The running node's pid and listeners; removed on a clean stop |
 | `node.lock` | One node per directory |
 | `blocks/NNNNNNNN.dat` | Block files: `TINGBLK\0`, ChainId, then `u64 length ‖ block ‖ H("node-block", block)` frames, as the reference lays them out |
-| `state.snap` | A state snapshot every 1,000 blocks, so a restart does not re-execute the chain |
+| `chain.db` | The database: the state at a base block (records and tree nodes), undo data, the stored-block list and the transaction and event indexes |
 | `peers.json`, `deferred.json`, `marks.json` | Address book, deferred transactions, operator marks |
 
 ## Layout
@@ -212,6 +212,7 @@ This is useful for tests and scripts.
 | `internal/conformance` | — | Runner for the reference's conformance material |
 | `internal/p2p` | Peer protocol | Frames, messages, client, server and header-first sync |
 | `internal/node` | — | Pool and deferred set, mining, peers, discovery and the REST API |
+| `internal/db` | — | The database: stored state, undo data, block list and indexes |
 | `internal/control` | — | Control channel |
 | `internal/daemon` | — | Data directory, configuration, and the node's control methods |
 | `internal/samples`, `internal/wasm/wasmtest` | — | Test programs assembled without a toolchain |

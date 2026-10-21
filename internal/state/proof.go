@@ -55,6 +55,13 @@ walk:
 				p.End = EndPresent
 			} else {
 				p.End, p.OtherKey, p.OtherValue = EndOther, n.key, n.value
+				if n.stub {
+					v, ok := t.src.Record(n.key)
+					if !ok {
+						panic(&StorageError{Err: errLeafRecord})
+					}
+					p.OtherValue = v
+				}
 			}
 			break walk
 		}
@@ -70,6 +77,9 @@ walk:
 				break walk
 			}
 			p.Siblings = append(p.Siblings, emptyHash)
+		}
+		if n.stub {
+			n = expand(t.src, n, 0)
 		}
 		if bit(&k, s) == 0 {
 			p.Siblings = append(p.Siblings, hashAt(n.right, s+1))

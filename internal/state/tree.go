@@ -10,6 +10,11 @@
 // bit where its records first split; the single-sided nodes the hash
 // definition places between a parent and that split are computed while
 // hashing rather than stored.
+//
+// A tree can also rest on a stored tree (a Source, a database snapshot): its
+// unchanged subtrees are then stubs that carry only their hash and position
+// and load from the source when a change or a proof needs them, and records
+// below a stub are read from the source's flat record table.
 package state
 
 import (
@@ -35,12 +40,16 @@ type node struct {
 	split uint16 // branch: the bit its records first differ in
 	leaf  bool
 	dirty bool
+	// stub marks a subtree that lies in the tree's source: its hash, key and
+	// split are known, its children (or, for a leaf, its value) are not.
+	stub bool
 }
 
 // Tree is an immutable record map with a cached commitment.
 type Tree struct {
 	root  *node
 	count int
+	src   Source // where stubs load from; nil for a tree wholly in memory
 }
 
 // Empty is the tree with no records.
@@ -67,15 +76,25 @@ func firstDiff(a, b *Key) int {
 	return 256
 }
 
-// Get returns the record's value and whether it is present.
+// Get returns the record's value and whether it is present. Below a stub,
+// the record comes from the source's record table.
 func (t Tree) Get(k Key) ([]byte, bool) {
 	n := t.root
 	for n != nil {
 		if n.leaf {
-			if n.key == k {
-				return n.value, true
+			if n.key != k {
+				return nil, false
 			}
-			return nil, false
+			if n.stub {
+				return t.src.Record(k)
+			}
+			return n.value, true
+		}
+		if n.stub {
+			if firstDiff(&n.key, &k) < int(n.split) {
+				return nil, false
+			}
+			return t.src.Record(k)
 		}
 		if bit(&k, int(n.split)) == 0 {
 			n = n.left
@@ -143,7 +162,7 @@ func (t Tree) Apply(changes []Change) Tree {
 	if gen == 0 { // skip the zero generation on wraparound
 		gen = genCounter.Add(1)
 	}
-	b := batch{gen: gen, count: t.count}
+	b := batch{gen: gen, count: t.count, src: t.src}
 	root := t.root
 	for i := range changes {
 		c := &changes[i]
@@ -154,12 +173,26 @@ func (t Tree) Apply(changes []Change) Tree {
 		}
 	}
 	rehash(root, len(changes) >= parallelRehashThreshold, 0)
-	return Tree{root: root, count: b.count}
+	return Tree{root: root, count: b.count, src: t.src}
 }
 
 type batch struct {
 	gen   uint32
 	count int
+	src   Source
+}
+
+// expand loads a stub branch's children from the source, as a node of
+// generation gen (0 for a read-only view).
+func expand(src Source, n *node, gen uint32) *node {
+	l, r := src.Branch(positionOf(n))
+	left, right := stubOf(l), stubOf(r)
+	// The stored children must make up the stored hash.
+	lh, rh := hashAt(left, int(n.split)+1), hashAt(right, int(n.split)+1)
+	if nodeHash(int(n.split), &lh, &rh) != n.hash {
+		panic(&StorageError{Err: errBranchHash})
+	}
+	return &node{hash: n.hash, key: n.key, split: n.split, left: left, right: right, gen: gen}
 }
 
 func (b *batch) newLeaf(k *Key, value []byte) *node {
@@ -197,6 +230,9 @@ func (b *batch) insert(n *node, k *Key, value []byte) *node {
 	}
 	if n.leaf {
 		if n.key == *k {
+			if n.stub {
+				return b.newLeaf(k, value) // replaces the stored leaf
+			}
 			if bytes.Equal(n.value, value) {
 				return n
 			}
@@ -211,17 +247,21 @@ func (b *batch) insert(n *node, k *Key, value []byte) *node {
 		b.count++
 		return b.newBranch(d, n, b.newLeaf(k, value))
 	}
-	right := bit(k, int(n.split)) == 1
-	child := n.left
+	e := n
+	if n.stub {
+		e = expand(b.src, n, b.gen)
+	}
+	right := bit(k, int(e.split)) == 1
+	child := e.left
 	if right {
-		child = n.right
+		child = e.right
 	}
 	nc := b.insert(child, k, value)
 	if nc == child {
 		// Unchanged, or mutated in place below a node this batch owns.
 		return n
 	}
-	m := b.own(n)
+	m := b.own(e)
 	if right {
 		m.right = nc
 	} else {
@@ -241,12 +281,19 @@ func (b *batch) remove(n *node, k *Key) *node {
 		}
 		return n
 	}
+	if firstDiff(&n.key, k) < int(n.split) {
+		return n // not below this branch
+	}
+	e := n
+	if n.stub {
+		e = expand(b.src, n, b.gen)
+	}
 	var child, other *node
-	right := bit(k, int(n.split)) == 1
+	right := bit(k, int(e.split)) == 1
 	if right {
-		child, other = n.right, n.left
+		child, other = e.right, e.left
 	} else {
-		child, other = n.left, n.right
+		child, other = e.left, e.right
 	}
 	nc := b.remove(child, k)
 	if nc == child {
@@ -257,7 +304,7 @@ func (b *batch) remove(n *node, k *Key) *node {
 		// as it is alone, which happens naturally as callers collapse too.
 		return other
 	}
-	m := b.own(n)
+	m := b.own(e)
 	if right {
 		m.right = nc
 	} else {
@@ -274,7 +321,7 @@ const parallelRehashThreshold = 2048
 const parallelDepth = 4
 
 func rehash(n *node, parallel bool, level int) {
-	if n == nil || !n.dirty {
+	if n == nil || !n.dirty || n.stub {
 		return
 	}
 	if n.leaf {
@@ -302,19 +349,30 @@ func rehash(n *node, parallel bool, level int) {
 	n.dirty = false
 }
 
-// Walk calls fn for every record in key order until fn returns false.
+// Walk calls fn for every record in key order until fn returns false. It
+// loads every stub on the way.
 func (t Tree) Walk(fn func(k Key, v []byte) bool) {
-	walk(t.root, fn)
+	t.walk(t.root, fn)
 }
 
-func walk(n *node, fn func(k Key, v []byte) bool) bool {
+func (t Tree) walk(n *node, fn func(k Key, v []byte) bool) bool {
 	if n == nil {
 		return true
 	}
 	if n.leaf {
+		if n.stub {
+			v, ok := t.src.Record(n.key)
+			if !ok {
+				panic(&StorageError{Err: errLeafRecord})
+			}
+			return fn(n.key, v)
+		}
 		return fn(n.key, n.value)
 	}
-	return walk(n.left, fn) && walk(n.right, fn)
+	if n.stub {
+		n = expand(t.src, n, 0)
+	}
+	return t.walk(n.left, fn) && t.walk(n.right, fn)
 }
 
 // Build constructs a tree from records. It sorts recs by key; keys must be

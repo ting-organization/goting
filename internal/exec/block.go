@@ -153,17 +153,24 @@ type Result struct {
 	Transactions [][]byte
 	Used         types.ResourceVector
 	State        state.Tree
+	// Changes are the block's net record writes, sorted by key: what State
+	// adds to the parent's state.
+	Changes []state.Change
 }
 
-// Finish commits the block's writes and returns the outcome.
-func (b *Builder) Finish() *Result {
+// Finish commits the block's writes and returns the outcome. It fails only
+// when a stored state cannot be read.
+func (b *Builder) Finish() (_ *Result, err error) {
+	defer state.Recover(&err)
+	changes := b.env.State.Changes()
 	return &Result{
 		Receipts:     b.receipts,
 		ReceiptBytes: b.encoded,
 		Transactions: b.txs,
 		Used:         b.used,
-		State:        b.env.State.Commit(),
-	}
+		State:        b.env.State.Base().Apply(changes),
+		Changes:      changes,
+	}, nil
 }
 
 // LastReceiptBytes returns the encoding of the most recent receipt.

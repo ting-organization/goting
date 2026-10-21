@@ -148,6 +148,12 @@ func (c *Chain) MarkInvalid(id hashing.Hash) (bool, error) {
 			back = back.Parent
 		}
 		c.publish(c.setTip(back))
+		// A tip below the database's base takes the base down with it.
+		if c.base != nil && c.base.Height > back.Height {
+			if err := c.rewind(back); err != nil {
+				return known, c.storageFail(err)
+			}
+		}
 	}
 	return known, c.activate()
 }

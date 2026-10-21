@@ -19,10 +19,10 @@ import (
 
 	"github.com/ting-organization/goting/internal/chain"
 	"github.com/ting-organization/goting/internal/control"
+	"github.com/ting-organization/goting/internal/db"
 	"github.com/ting-organization/goting/internal/hashing"
 	"github.com/ting-organization/goting/internal/node"
 	"github.com/ting-organization/goting/internal/seed"
-	"github.com/ting-organization/goting/internal/state"
 	"github.com/ting-organization/goting/internal/types"
 )
 
@@ -36,12 +36,19 @@ func InitSeed(dir string, g *types.GenesisConfig) (uint64, error) {
 	if err != nil || len(blocks) == 0 {
 		return 0, err
 	}
-	store, err := chain.OpenFileStore(filepath.Join(dir, "blocks"), g.ChainID())
+	database, err := db.Open(filepath.Join(dir, "chain.db"), g.ChainID())
+	if err != nil {
+		return 0, err
+	}
+	defer database.Close()
+	store, err := chain.OpenStoredBlocks(filepath.Join(dir, "blocks"), g.ChainID(), database)
 	if err != nil {
 		return 0, err
 	}
 	defer store.Close()
-	c, err := chain.New(g, nil, store, chain.DefaultConfig())
+	ccfg := chain.DefaultConfig()
+	ccfg.State = database
+	c, err := chain.New(g, nil, store, ccfg)
 	if err != nil {
 		return 0, err
 	}
@@ -49,7 +56,7 @@ func InitSeed(dir string, g *types.GenesisConfig) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return rep.Tip.Height, nil
+	return rep.Tip.Height, c.Settle()
 }
 
 // Daemon is a running node.
@@ -104,7 +111,12 @@ func Run(dir string, log *slog.Logger) error {
 		ln.Close()
 	}
 
-	store, err := chain.OpenFileStore(filepath.Join(dir, "blocks"), g.ChainID())
+	database, err := db.Open(filepath.Join(dir, "chain.db"), g.ChainID())
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	store, err := chain.OpenStoredBlocks(filepath.Join(dir, "blocks"), g.ChainID(), database)
 	if err != nil {
 		return err
 	}
@@ -112,30 +124,41 @@ func Run(dir string, log *slog.Logger) error {
 	if store.Damaged > 0 {
 		log.Warn("block files: damaged frames passed over; their blocks are fetched again", "frames", store.Damaged)
 	}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	var fatalMu sync.Mutex
+	var fatal error
+	setFatal := func(err error) {
+		fatalMu.Lock()
+		if fatal == nil {
+			fatal = err
+		}
+		fatalMu.Unlock()
+		stop()
+	}
 	ccfg := chain.DefaultConfig()
 	ccfg.MarksPath = filepath.Join(dir, "marks.json")
+	ccfg.State = database
+	ccfg.UndoWindow = cfg.UndoWindow
+	if cfg.UndoWindow == 0 {
+		ccfg.UndoWindow = ^uint64(0) // 0 keeps all undo data
+	}
+	ccfg.Fatal = func(err error) {
+		log.Error("stopping: storage failure", "err", err)
+		setFatal(err)
+	}
 	c, err := chain.New(g, nil, store, ccfg)
 	if err != nil {
 		return err
 	}
-	snapPath := filepath.Join(dir, "state.snap")
 	start := time.Now()
-	var loaded int
-	if _, err := os.Stat(snapPath); err == nil {
-		info, st, err := state.ReadSnapshot(snapPath)
-		if err != nil {
-			return fmt.Errorf("reading %s: %w", snapPath, err)
-		}
-		if loaded, err = c.LoadFromSnapshot(info, st); err != nil {
-			return err
-		}
-	} else if loaded, err = c.Load(); err != nil {
+	loaded, err := c.Load()
+	if err != nil {
 		return err
 	}
-	log.Info("chain loaded", "blocks", loaded, "height", c.Tip().Height, "elapsed", time.Since(start))
-
-	ctx, stop := context.WithCancel(context.Background())
-	defer stop()
+	base := c.Base()
+	log.Info("chain loaded", "blocks", loaded, "height", c.Tip().Height, "state_base", base.Height,
+		"elapsed", time.Since(start))
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
@@ -151,18 +174,9 @@ func Run(dir string, log *slog.Logger) error {
 	n := node.New(c, node.Config{Name: cfg.Name, Mine: cfg.MinerEnabled, Producer: cfg.Producer(), Votes: cfg.Votes,
 		Workers: int(cfg.MinerThreads), Interval: time.Duration(cfg.MinerSpacing) * time.Second,
 		PoolTransactions: cfg.MempoolTransactions, PoolMiB: int(cfg.MempoolMiB),
-		DeferredPath: filepath.Join(dir, "deferred.json"), SnapshotPath: snapPath,
-		SnapshotEvery: 1000, SnapshotDepth: 64}, log)
+		DeferredPath: filepath.Join(dir, "deferred.json")}, log)
 	n.IndexCanonical()
-	var fatal error
-	n.Fatal = func(err error) {
-		d.mu.Lock()
-		if fatal == nil {
-			fatal = err
-		}
-		d.mu.Unlock()
-		stop()
-	}
+	n.Fatal = setFatal
 	d.node = n
 	var seeds []string
 	if cfg.Discovery && g.ChainID() == types.ProductionGenesis().ChainID() {
@@ -223,7 +237,12 @@ func Run(dir string, log *slog.Logger) error {
 	}
 	d.mu.Unlock()
 	wg.Wait()
+	if err := c.Settle(); err != nil {
+		log.Error("settling the state", "err", err)
+	}
 	os.Remove(filepath.Join(dir, "runtime.json"))
+	fatalMu.Lock()
+	defer fatalMu.Unlock()
 	return fatal
 }
 

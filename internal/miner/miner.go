@@ -80,14 +80,20 @@ func Build(c *chain.Chain, parent *chain.Entry, opts Options, txs [][]byte) (*Te
 		}
 		t.Receipts = append(t.Receipts, r)
 	}
-	a := Assemble(c.ChainID(), ctx, target, opts.Votes, b)
+	a, err := Assemble(c.ChainID(), ctx, target, opts.Votes, b)
+	if err != nil {
+		return nil, err
+	}
 	a.Skipped = t.Skipped
 	return a, nil
 }
 
 // Assemble finishes a template from a builder whose transactions are final.
-func Assemble(chainID hashing.Hash, ctx *vm.BlockContext, target types.Target, votes [4]uint8, b *exec.Builder) *Template {
-	res := b.Finish()
+func Assemble(chainID hashing.Hash, ctx *vm.BlockContext, target types.Target, votes [4]uint8, b *exec.Builder) (*Template, error) {
+	res, err := b.Finish()
+	if err != nil {
+		return nil, err
+	}
 	t := &Template{Skipped: map[int]error{}}
 	t.Receipts = res.Receipts
 	t.Body = &types.Body{ProducerData: ctx.Producer, Transactions: res.Transactions, Receipts: res.ReceiptBytes}
@@ -105,7 +111,7 @@ func Assemble(chainID hashing.Hash, ctx *vm.BlockContext, target types.Target, v
 		Votes:            votes,
 		ProducerHash:     types.ProducerHash(ctx.Producer),
 	}
-	return t
+	return t, nil
 }
 
 // Block returns the template's block.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ting-organization/goting/internal/chain"
 	"github.com/ting-organization/goting/internal/consensus"
+	"github.com/ting-organization/goting/internal/db"
 	"github.com/ting-organization/goting/internal/hashing"
 	"github.com/ting-organization/goting/internal/miner"
 	"github.com/ting-organization/goting/internal/types"
@@ -60,6 +61,10 @@ type Node struct {
 	mu     sync.RWMutex
 	occ    map[hashing.Hash][]Location   // canonical occurrences by TransactionId
 	events map[hashing.Hash][]EventPlace // canonical events by emitting program
+	// With a database, the indexes above hold only the blocks above its
+	// base, which it lists itself; indexed records what each block added.
+	indexed map[hashing.Hash]indexedBlock
+	pruned  uint64 // the base height up to which the indexes are pruned
 	// started is when the node started, for its status.
 	started time.Time
 
@@ -88,6 +93,7 @@ func New(c *chain.Chain, cfg Config, log *slog.Logger) *Node {
 	}
 	n := &Node{Chain: c, cfg: cfg, log: log, tx: newTxPool(cfg.PoolTransactions, cfg.PoolMiB, cfg.DeferredPath),
 		occ: make(map[hashing.Hash][]Location), events: make(map[hashing.Hash][]EventPlace),
+		indexed:    map[hashing.Hash]indexedBlock{},
 		tipChanged: make(chan struct{}, 1), started: time.Now(), producer: cfg.Producer, votes: cfg.Votes}
 	c.OnTip(n.published)
 	return n
@@ -97,12 +103,69 @@ func New(c *chain.Chain, cfg Config, log *slog.Logger) *Node {
 // restores the deferred set.
 func (n *Node) IndexCanonical() {
 	tip := n.Chain.Tip()
-	for h := uint64(1); h <= tip.Height; h++ {
+	from := uint64(1)
+	if b := n.Chain.Base(); b != nil {
+		from, n.pruned = b.Height+1, b.Height
+	}
+	for h := from; h <= tip.Height; h++ {
 		if e, ok := n.Chain.AtHeight(h); ok {
 			n.index(e, true)
 		}
 	}
 	n.loadDeferred()
+}
+
+type indexedBlock struct {
+	height    uint64
+	txs       []hashing.Hash
+	contracts []hashing.Hash
+}
+
+// pruneIndex drops from the in-memory indexes the blocks the database now
+// lists: those at or below its base.
+func (n *Node) pruneIndex() {
+	b := n.Chain.Base()
+	if b == nil || b.Height <= n.pruned {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, ib := range n.indexed {
+		if ib.height <= b.Height {
+			n.unindexLocked(id, ib)
+		}
+	}
+	n.pruned = b.Height
+}
+
+func (n *Node) unindexLocked(block hashing.Hash, ib indexedBlock) {
+	for _, c := range ib.contracts {
+		kept := n.events[c][:0]
+		for _, p := range n.events[c] {
+			if p.Block != block {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) == 0 {
+			delete(n.events, c)
+		} else {
+			n.events[c] = kept
+		}
+	}
+	for _, id := range ib.txs {
+		locs := n.occ[id][:0]
+		for _, l := range n.occ[id] {
+			if l.Block != block {
+				locs = append(locs, l)
+			}
+		}
+		if len(locs) == 0 {
+			delete(n.occ, id)
+		} else {
+			n.occ[id] = locs
+		}
+	}
+	delete(n.indexed, block)
 }
 
 // EventPlace is one canonical event of a program: its block, the
@@ -152,67 +215,83 @@ func (n *Node) index(e *chain.Entry, add bool) ([]hashing.Hash, []uint8) {
 	ids, sts, events := n.txIDs(e)
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if !add {
+		if ib, ok := n.indexed[e.ID]; ok {
+			n.unindexLocked(e.ID, ib)
+		}
+		return ids, sts
+	}
+	if _, ok := n.indexed[e.ID]; ok {
+		return ids, sts
+	}
+	ib := indexedBlock{height: e.Height, txs: ids}
 	for c, places := range events {
-		if add {
-			n.events[c] = append(n.events[c], places...)
-			continue
-		}
-		kept := n.events[c][:0]
-		for _, p := range n.events[c] {
-			if p.Block != e.ID {
-				kept = append(kept, p)
-			}
-		}
-		if len(kept) == 0 {
-			delete(n.events, c)
-		} else {
-			n.events[c] = kept
-		}
+		n.events[c] = append(n.events[c], places...)
+		ib.contracts = append(ib.contracts, c)
 	}
 	for i, id := range ids {
-		if add {
-			n.occ[id] = append(n.occ[id], Location{Height: e.Height, Block: e.ID, Index: i, Status: sts[i]})
-			continue
-		}
-		locs := n.occ[id][:0]
-		for _, l := range n.occ[id] {
-			if l.Block != e.ID {
-				locs = append(locs, l)
-			}
-		}
-		if len(locs) == 0 {
-			delete(n.occ, id)
-		} else {
-			n.occ[id] = locs
-		}
+		n.occ[id] = append(n.occ[id], Location{Height: e.Height, Block: e.ID, Index: i, Status: sts[i]})
 	}
+	n.indexed[e.ID] = ib
 	return ids, sts
 }
 
 // EventsOf returns the canonical blocks, from height from on, holding
 // events of a program, or of one of its topics: at most limit blocks, each
-// with the events' places, and whether more follow.
+// with the events' places, and whether more follow. With a database, the
+// blocks it lists come from it.
 func (n *Node) EventsOf(contract hashing.Hash, topic *hashing.Hash, from uint64, limit int) ([][]EventPlace, bool) {
+	var groups [][]EventPlace
+	add := func(p EventPlace) {
+		if len(groups) > 0 && groups[len(groups)-1][0].Block == p.Block {
+			groups[len(groups)-1] = append(groups[len(groups)-1], p)
+			return
+		}
+		groups = append(groups, []EventPlace{p})
+	}
 	n.mu.RLock()
-	defer n.mu.RUnlock()
 	all := n.events[contract]
 	i := sort.Search(len(all), func(i int) bool { return all[i].Height >= from })
-	var out [][]EventPlace
-	for ; i < len(all); i++ {
-		p := all[i]
-		if topic != nil && (!p.HasTopic || p.Topic != *topic) {
-			continue
+	for ; i < len(all) && len(groups) <= limit; i++ {
+		if p := all[i]; topic == nil || (p.HasTopic && p.Topic == *topic) {
+			add(p)
 		}
-		if len(out) > 0 && out[len(out)-1][0].Block == p.Block {
-			out[len(out)-1] = append(out[len(out)-1], p)
-			continue
-		}
-		if len(out) == limit {
-			return out, true
-		}
-		out = append(out, []EventPlace{p})
 	}
-	return out, false
+	n.mu.RUnlock()
+	mem := groups
+	if d := n.Chain.Database(); d != nil {
+		inMemory := map[hashing.Hash]bool{}
+		for _, g := range mem {
+			inMemory[g[0].Block] = true
+		}
+		groups = nil
+		err := d.Events(contract, topic, from, func(r db.EventRow) bool {
+			if inMemory[r.Block] || !n.canonical(r.Height, r.Block) {
+				return true
+			}
+			p := EventPlace{Height: r.Height, Block: r.Block, Tx: int(r.Tx), Event: int(r.Event)}
+			if r.Topic != nil {
+				p.Topic, p.HasTopic = *r.Topic, true
+			}
+			add(p)
+			return len(groups) <= limit
+		})
+		if err != nil {
+			n.log.Error("event index", "err", err)
+		}
+		groups = append(groups, mem...)
+		sort.SliceStable(groups, func(i, j int) bool { return groups[i][0].Height < groups[j][0].Height })
+	}
+	if len(groups) > limit {
+		return groups[:limit], true
+	}
+	return groups, false
+}
+
+// canonical reports whether the block at height is the canonical one.
+func (n *Node) canonical(height uint64, block hashing.Hash) bool {
+	e, ok := n.Chain.AtHeight(height)
+	return ok && e.ID == block
 }
 
 // PeerInfo lists peer connections.
@@ -228,9 +307,7 @@ func (n *Node) PeerInfo() []PeerInfo {
 // RelayEcho included it at all.
 func (n *Node) recentlyIncluded(id hashing.Hash) bool {
 	tip := n.Chain.Tip().Height
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	for _, l := range n.occ[id] {
+	for _, l := range n.Occurrences(id) {
 		if l.Height+RelayRecent > tip && l.Status == types.StatusSuccess {
 			return true
 		}
@@ -243,9 +320,7 @@ func (n *Node) recentlyIncluded(id hashing.Hash) bool {
 
 // succeededAbove reports a successful canonical inclusion above height.
 func (n *Node) succeededAbove(id hashing.Hash, height uint64) bool {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	for _, l := range n.occ[id] {
+	for _, l := range n.Occurrences(id) {
 		if l.Height > height && l.Status == types.StatusSuccess {
 			return true
 		}
@@ -253,11 +328,34 @@ func (n *Node) succeededAbove(id hashing.Hash, height uint64) bool {
 	return false
 }
 
-// Occurrences returns where a transaction appears in the canonical chain.
+// Occurrences returns where a transaction appears in the canonical chain,
+// lowest first.
 func (n *Node) Occurrences(id hashing.Hash) []Location {
 	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return append([]Location(nil), n.occ[id]...)
+	out := append([]Location(nil), n.occ[id]...)
+	n.mu.RUnlock()
+	if d := n.Chain.Database(); d != nil {
+		rows, err := d.Occurrences(id)
+		if err != nil {
+			n.log.Error("occurrence index", "err", err)
+		}
+		seen := map[hashing.Hash]bool{}
+		for _, l := range out {
+			seen[l.Block] = true
+		}
+		for _, r := range rows {
+			if !seen[r.Block] && n.canonical(r.Height, r.Block) {
+				out = append(out, Location{Height: r.Height, Block: r.Block, Index: int(r.Index), Status: r.Status})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Height != out[j].Height {
+				return out[i].Height < out[j].Height
+			}
+			return out[i].Index < out[j].Index
+		})
+	}
+	return out
 }
 
 // SubmitTransaction offers a transaction as the node's own.
@@ -530,7 +628,10 @@ func (n *Node) Template(explicit []hashing.Hash) (*miner.Template, error) {
 			}
 		}
 	}
-	tpl := miner.Assemble(n.Chain.ChainID(), ctx, target, n.Votes(), b)
+	tpl, err := miner.Assemble(n.Chain.ChainID(), ctx, target, n.Votes(), b)
+	if err != nil {
+		return nil, err
+	}
 	p.mu.Lock()
 	removed := false
 	for _, a := range b.Attempts() {

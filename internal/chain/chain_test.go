@@ -292,7 +292,10 @@ func buildUnchecked(t *testing.T, c *chain.Chain, parent *chain.Entry, ts uint64
 			t.Fatal(err)
 		}
 	}
-	res := b.Finish()
+	res, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := &types.Header{
 		ProtocolVersion: 1, ChainID: c.ChainID(), Height: height, ParentID: parent.ID, Timestamp: ts,
 		Target: target, TransactionsRoot: commit.TransactionsRoot(res.Transactions),

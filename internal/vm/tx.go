@@ -89,7 +89,10 @@ type outcome struct {
 // env.State. guard is the block capacity left for it, as an absolute bound
 // on its consumption. On ErrBlockFull the state is left as before the
 // transaction.
-func ExecuteTransaction(env *Env, guard types.ResourceVector, raw []byte, tx *types.Transaction) (*types.Receipt, error) {
+func ExecuteTransaction(env *Env, guard types.ResourceVector, raw []byte, tx *types.Transaction) (_ *types.Receipt, err error) {
+	// A stored state that cannot be read fails the execution, not the
+	// transaction: no receipt.
+	defer state.Recover(&err)
 	x := &TxExec{
 		env:      env,
 		txID:     types.TransactionID(env.Block.ChainID, raw),
@@ -139,6 +142,14 @@ func ExecuteTransaction(env *Env, guard types.ResourceVector, raw []byte, tx *ty
 // explicit stack, so nesting never uses the native stack (rules §20.4, §24.4).
 func (x *TxExec) execute(top *activation, req *request) (outcome, error) {
 	var stack []*activation
+	// Invocations a fault or a full block leaves behind give their memory
+	// back too.
+	defer func() {
+		for _, a := range stack {
+			a.m.release()
+			a.m = nil
+		}
+	}()
 	o, act, err := x.start(top, req)
 	for {
 		if err != nil {
@@ -156,6 +167,7 @@ func (x *TxExec) execute(top *activation, req *request) (outcome, error) {
 		switch r.kind {
 		case runDone:
 			stack = stack[:len(stack)-1]
+			cur.m.release()
 			cur.m = nil // the instance disappears with the invocation
 			o, err = x.finish(cur, r.status, r.result)
 			act = nil
@@ -249,6 +261,7 @@ func (x *TxExec) startInvoke(act *activation) (outcome, *activation, error) {
 	m := newMachine(x, act, mod)
 	act.m = m
 	if st := m.enter(mod.Funcs[mod.Invoke]); st != DebitOK {
+		m.release()
 		act.m = nil
 		if st == DebitBlockFull {
 			return outcome{}, nil, ErrBlockFull

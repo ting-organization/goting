@@ -620,12 +620,11 @@ None of these affects which blocks are valid.
 
 | Area | Reference | This node |
 |---|---|---|
-| State storage | redb database with records, tree nodes and per-block undo/redo; restart in constant time; undo pruned to `undo_window` | state in memory as persistent trees; restart from a snapshot taken every 1,000 blocks; `undo_window` and `db_cache_mib` accepted but unused |
-| Indexes | transaction occurrences and program events in database tables written with each block | in memory, rebuilt from canonical blocks at start |
-| Header index | held headers above a settled height; older ones in the database | every header in memory |
-| Deep reorganizations | below the undo window, replay from genesis in the background | from the nearest retained or checkpointed state (one every 1,000 blocks) |
+| State storage | redb database with records, tree nodes and per-block undo/redo; every block committed; undo pruned to `undo_window` | bbolt database with records, tree nodes and undo data (no redo); the base trails the tip by 128–256 blocks and moves in one commit; undo kept for `undo_window` blocks below the base (43,200; 0 keeps all); `db_cache_mib` accepted but unused, the operating system's page cache serving instead |
+| Header index | held headers above a settled height; older ones in the database | every header in memory, restored from the database's block rows at start |
+| Deep reorganizations | below the undo window, replay from genesis in the background | below the undo window, refused |
 | Explorer, wiki, Swagger UI, `/openapi.json`, `ting docs` | served | not served |
-| Status | published every 0.2 s; `/health` answers 504 when that is older than 30 s | computed per request; `undo_pruned` and `settled_height` are 0 |
+| Status | published every 0.2 s; `/health` answers 504 when that is older than 30 s | computed per request; `settled_height` is the database's base |
 | Pluggable selection and nonce search | Rust traits a mining fork replaces | fixed (FirstIn turns, CPU search) |
 
 ### Issues found in this stage
@@ -641,3 +640,133 @@ None of these affects which blocks are valid.
   others running until they noticed the closed connection. Every task of a
   connection now ends before the connection is counted as ended (found by the
   race detector in the discovery test).
+
+## Stage 3, continued: sync speed, VM memory and the database
+
+Date: 2026-10-21. The repository was published as
+[ting-organization/goting](https://github.com/ting-organization/goting), and
+the module path became `github.com/ting-organization/goting`.
+
+### How fast a node syncs from zero
+
+Measured against the production network (height 513, 8.65 MB of blocks), from
+a machine 47 ms from the seed node:
+
+| Measurement | Result |
+|---|---|
+| A fresh node, 0 to 513, from the seed node | 13.1 s |
+| The 325 seed blocks (23,540 transactions) validated locally | 2.1 s |
+| Download from the seed node, 1 to 63 requests in flight | 0.82–0.88 MB/s |
+| This machine's download from a CDN | 11 MB/s |
+
+The download, not validation, set the pace: the slow stretches are exactly the
+large blocks. Deeper pipelining did not help, so the limit was bandwidth per
+connection on the seed node's side, not latency.
+
+Between two nodes on one machine, a 30,938-block development chain synced at
+about 127 blocks a second. That is the peer protocol's request units: 200 a
+second after a burst of 2,000, with `raw` costing 1 plus 1 per 64 KiB. The
+reference node charges the same, so one peer serves at most about 100 small
+blocks a second to one connection. This is protection against abusive peers,
+not a fault; more peers multiply it. Chain processing alone runs at 7,400
+small blocks a second in memory and 3,300 with the database.
+
+### VM: linear memory churn
+
+Profiling the seed replay found `vm.newMachine` allocating **28.5 GB** for
+23,540 transactions. Every invocation allocated and zeroed the module's whole
+declared minimum memory, about 1 MB for typical compiled programs, even when
+it touched a few bytes. Only 16% of CPU went to the interpreter; the rest was
+the garbage collector, `madvise` and thread wake-ups.
+
+Linear memory now comes from a pool by power-of-two size class and is zeroed
+when its invocation ends, including when a fault or a full block abandons it.
+Pooled buffers are zero throughout their capacity. Memories above 64 MiB,
+which only programs declaring hundreds of MiB have, are mapped from the
+operating system outside the Go heap and unmapped when the invocation ends.
+The seed's VM tests reach those sizes on purpose.
+
+Tests check that every invocation sees fresh memory after reuse, after a trap,
+and in pages added by `memory.grow`, for pooled and mapped memories. A
+deliberately broken clear makes them fail.
+
+| Seed replay | Before | After |
+|---|---|---|
+| Wall time | 2.06 s | 1.33 s |
+| CPU time | 5.2 s | 1.37 s |
+| Peak resident memory | 1.09 GB | 0.50–0.65 GB |
+
+The remaining peak is the seed's own programs touching hundreds of MB.
+
+### The database
+
+The state, undo data, block list and indexes now live in a database
+(`chain.db`); see ARCHITECTURE.md, "With a database". In short:
+
+- **State.** Flat records and branch nodes keyed by position (split bit and
+  prefix), so the database holds exactly the current tree. Records read in one
+  lookup.
+- **Window.** In memory, the trees of the blocks above a base block rest on the
+  stored tree through stubs that load on demand, each load checked against its
+  parent's hash.
+- **Flush.** The base moves in one atomic commit every 128 blocks, with undo
+  data, index rows and block rows. The trees left in memory are rebuilt and
+  every root checked.
+- **Rewind.** A reorganization forking below the base applies undo data back
+  to the fork first, checking every intermediate root.
+- **Restart.** Only the frames after the block-file cursor are scanned, and
+  only the blocks above the base execute: none after a clean stop or `init`.
+
+| Measurement (production, 538 blocks) | Before | After |
+|---|---|---|
+| `init` (imports the 325-block seed) | 4.2 s with per-frame fsync | 2.0 s |
+| Restart | re-execute, or load `state.snap` and re-check every block | 20 ms, 45 MB resident |
+| A transaction at height 2, after its block was flushed | in memory | through the database index |
+
+**Choosing the engine.** Pebble was the first choice. Its zstd compression
+links C code whenever cgo is enabled, and that broke ordinary and `-race`
+builds on this machine: the installed Command Line Tools cannot link against
+the macOS 27 SDK. It would also make every installation depend on a working C
+toolchain. Pebble v1 has the same dependency.
+
+bbolt is pure Go, small, and a B+tree like the reference's redb, so it was
+chosen instead. Its writer cannot grow the file while read transactions are
+open, so views do not pin snapshots. They read the database as it is, which is
+correct for any tree whose block descends from the base; rewinds bump an epoch
+that expires older views.
+
+The file grows by bbolt's mapping steps and reuses freed pages: 46 MB for
+31,500 records here.
+
+**Block-file durability changed with it.** Each frame used to be forced to
+disk before `Put` returned, several milliseconds each with macOS's full fsync.
+Frames are now forced before every commit that moves the base past them, and
+otherwise at most 2 s after they are written. A frame lost in a crash lies
+above the base and is fetched again, which is the reference's ordering:
+frames before the commit that refers to them.
+
+**How it was tested:**
+
+- a differential test of stored against in-memory trees: 300 rounds of random
+  inserts, updates and deletes over keys with long shared prefixes, with
+  flushes, checking roots, reads, proofs, walks, and that the store holds
+  exactly the tree's branches after every flush;
+- chain tests in database mode against memory mode, block by block;
+- restart, including that only frames after the cursor are scanned;
+- a reorganization forking below the base and back again;
+- a damaged database stopping the node instead of judging blocks invalid;
+- the node's indexes through the database across a restart;
+- live: production init, sync to the tip and restart; a development pair
+  syncing over the peer protocol.
+
+**Issues found while building it.** A state the API derived on its own,
+concurrently with a rewind, could have been kept on an expired view. Its next
+use would then look like a storage failure and stop the node. Such a state is
+no longer kept: the chain counts rewinds and compares before keeping one.
+
+**Not done yet:**
+
+- every header stays in memory;
+- `db_cache_mib` is accepted but unused;
+- a reorganization below the undo window is refused, where the reference
+  replays from genesis in the background.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/ting-organization/goting/internal/hashing"
 	"github.com/ting-organization/goting/internal/types"
@@ -106,16 +107,20 @@ const (
 )
 
 // FileStore keeps blocks in segment files. An in-memory index of frame
-// locations is rebuilt by scanning on open; every frame is forced to disk
-// before Put returns.
+// locations is rebuilt by scanning on open. Frames are forced to disk by
+// Sync, which the chain calls before every database commit that moves its
+// base past them, and otherwise at most syncInterval after they are written:
+// a frame lost in a crash before then is only fetched again.
 type FileStore struct {
-	mu      sync.Mutex
-	dir     string
-	chainID hashing.Hash
-	files   []*os.File // by segment number
-	size    int64      // of the last segment
-	index   map[hashing.Hash]location
-	order   []hashing.Hash
+	mu       sync.Mutex
+	dir      string
+	chainID  hashing.Hash
+	files    []*os.File // by segment number
+	size     int64      // of the last segment
+	index    map[hashing.Hash]location
+	order    []hashing.Hash
+	unsynced map[*os.File]struct{}
+	synced   time.Time
 	// Damaged counts frames passed over on open: torn or zero-filled tails
 	// of the last segment are truncated, damage earlier is skipped.
 	Damaged int
@@ -127,16 +132,53 @@ type location struct {
 	length int64
 }
 
+// Location is where a block lies in the block files: its segment, the
+// offset of its bytes and their length.
+type Location struct {
+	Segment uint32
+	Offset  int64
+	Length  int64
+}
+
+// Cursor is a position in the block files: the end of the frames before
+// it, which a database records with their locations.
+type Cursor struct {
+	Segment uint32
+	Offset  int64
+}
+
+// covers reports whether the frame at l lies before the cursor.
+func (c Cursor) covers(l location) bool {
+	return uint32(l.seg) < c.Segment || (uint32(l.seg) == c.Segment && l.offset < c.Offset)
+}
+
+// Frame is a stored block and its location.
+type Frame struct {
+	ID       hashing.Hash
+	Location Location
+}
+
 // ErrWrongChain reports block files made for another genesis.
 var ErrWrongChain = errors.New("block files belong to another chain")
 
 // OpenFileStore opens or creates the block files in dir for chainID. Files
 // made for another chain are refused, never reset.
 func OpenFileStore(dir string, chainID hashing.Hash) (*FileStore, error) {
+	return OpenFileStoreFrom(dir, chainID, Cursor{}, nil)
+}
+
+// OpenFileStoreFrom opens the block files knowing the frames before from:
+// known gives their locations, as a database recorded them, and only the
+// frames after from are scanned. Frames before it are checked when read.
+func OpenFileStoreFrom(dir string, chainID hashing.Hash, from Cursor, known []Frame) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &FileStore{dir: dir, chainID: chainID, index: make(map[hashing.Hash]location)}
+	s := &FileStore{dir: dir, chainID: chainID, index: make(map[hashing.Hash]location, len(known)),
+		unsynced: map[*os.File]struct{}{}, synced: time.Now()}
+	for _, f := range known {
+		s.index[f.ID] = location{seg: int(f.Location.Segment), offset: f.Location.Offset, length: f.Location.Length}
+	}
 	for n := 0; ; n++ {
 		f, err := os.OpenFile(s.segPath(n), os.O_RDWR, 0o644)
 		if errors.Is(err, os.ErrNotExist) {
@@ -147,12 +189,23 @@ func OpenFileStore(dir string, chainID hashing.Hash) (*FileStore, error) {
 			return nil, err
 		}
 		s.files = append(s.files, f)
-		size, err := s.scan(n, f)
+		start := int64(segmentHead)
+		switch {
+		case uint32(n) < from.Segment:
+			start = -1 // wholly before the cursor
+		case uint32(n) == from.Segment && from.Offset > segmentHead:
+			start = from.Offset
+		}
+		size, err := s.scan(n, f, start)
 		if err != nil {
 			s.Close()
 			return nil, err
 		}
 		s.size = size
+	}
+	if len(s.files) < int(from.Segment)+1 && (from.Segment > 0 || from.Offset > segmentHead) {
+		s.Close()
+		return nil, fmt.Errorf("block files end before the position the database records")
 	}
 	if len(s.files) == 0 {
 		if err := s.newSegment(); err != nil {
@@ -169,16 +222,30 @@ func (s *FileStore) segPath(n int) string {
 // scan indexes one segment's frames and returns where its valid frames end.
 // A damaged frame ends the scan; in the last segment it is truncated with
 // everything after it.
-func (s *FileStore) scan(n int, f *os.File) (int64, error) {
-	r := bufio.NewReaderSize(f, 1<<20)
+func (s *FileStore) scan(n int, f *os.File, start int64) (int64, error) {
 	head := make([]byte, segmentHead)
-	if _, err := io.ReadFull(r, head); err != nil || string(head[:8]) != segmentMagic {
+	if _, err := io.ReadFull(f, head); err != nil || string(head[:8]) != segmentMagic {
 		return 0, fmt.Errorf("%s: not a block file", s.segPath(n))
 	}
 	if hashing.Hash(head[8:]) != s.chainID {
 		return 0, fmt.Errorf("%s: %w", s.segPath(n), ErrWrongChain)
 	}
-	off := int64(segmentHead)
+	if start < 0 {
+		st, err := f.Stat()
+		if err != nil {
+			return 0, err
+		}
+		return st.Size(), nil
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if start > st.Size() {
+		return 0, fmt.Errorf("%s ends before the position the database records", s.segPath(n))
+	}
+	r := bufio.NewReaderSize(io.NewSectionReader(f, start, st.Size()-start), 1<<20)
+	off := start
 	var lenBuf [8]byte
 	var sum hashing.Hash
 	for {
@@ -260,6 +327,9 @@ func (s *FileStore) Put(id hashing.Hash, raw []byte) error {
 	}
 	frame := int64(len(raw)) + frameExtra
 	if s.size > segmentHead && s.size+frame > SegmentSize {
+		if err := s.syncLocked(); err != nil {
+			return err
+		}
 		if err := s.newSegment(); err != nil {
 			return err
 		}
@@ -275,12 +345,34 @@ func (s *FileStore) Put(id hashing.Hash, raw []byte) error {
 		f.Truncate(s.size)
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
+	s.unsynced[f] = struct{}{}
 	s.index[id] = location{seg: n, offset: s.size + 8, length: int64(len(raw))}
 	s.order = append(s.order, id)
 	s.size += frame
+	if time.Since(s.synced) >= syncInterval {
+		return s.syncLocked()
+	}
+	return nil
+}
+
+// syncInterval bounds how long a written frame may wait for Sync.
+const syncInterval = 2 * time.Second
+
+// Sync forces every frame written so far to disk.
+func (s *FileStore) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncLocked()
+}
+
+func (s *FileStore) syncLocked() error {
+	for f := range s.unsynced {
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		delete(s.unsynced, f)
+	}
+	s.synced = time.Now()
 	return nil
 }
 
@@ -340,11 +432,11 @@ func (s *FileStore) Len() int {
 	return len(s.index)
 }
 
-// Close closes the block files.
+// Close forces the block files to disk and closes them.
 func (s *FileStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var first error
+	first := s.syncLocked()
 	for _, f := range s.files {
 		if err := f.Close(); err != nil && first == nil {
 			first = err
@@ -381,4 +473,39 @@ func SeedFromStore(store BlockStore, genesisID, pinID hashing.Hash, n uint64) []
 		return nil
 	}
 	return list
+}
+
+// End is the cursor at the end of the frames written so far.
+func (s *FileStore) End() Cursor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return Cursor{Segment: uint32(len(s.files) - 1), Offset: s.size}
+}
+
+// FramesAfter lists the blocks stored at or after c, in the order stored.
+func (s *FileStore) FramesAfter(c Cursor) []Frame {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Frame
+	for _, id := range s.order {
+		l := s.index[id]
+		if !c.covers(l) {
+			out = append(out, Frame{ID: id, Location: Location{Segment: uint32(l.seg), Offset: l.offset, Length: l.length}})
+		}
+	}
+	return out
+}
+
+// Trim forgets which frames before c were stored this run: a database now
+// lists them.
+func (s *FileStore) Trim(c Cursor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.order[:0]
+	for _, id := range s.order {
+		if !c.covers(s.index[id]) {
+			kept = append(kept, id)
+		}
+	}
+	s.order = kept
 }

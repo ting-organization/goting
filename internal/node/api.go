@@ -438,13 +438,22 @@ func (n *Node) Status() map[string]any {
 		reorg = r
 	}
 	pending, bytes := n.PoolLen(), n.PoolBytes()
+	// With a database: undo data is pruned below undo_pruned, and the
+	// state of settled_height, the database's base, is the one it holds.
+	var undoPruned, settled uint64
+	if b := c.Base(); b != nil {
+		settled = b.Height
+		if floor, err := c.Database().UndoFloor(); err == nil {
+			undoPruned = floor
+		}
+	}
 	return map[string]any{"name": n.cfg.Name, "version": Version, "network": n.network(),
 		"chain_id": c.ChainID(), "genesis": c.GenesisID(), "height": tip.Height, "tip": tip.ID,
 		"work": tip.ChainWork.String(), "state_root": root, "limits": n.nextLimits(),
 		"resource_order": []string{"C", "S", "D", "G"}, "mempool_count": pending, "mempool_bytes": bytes,
 		"deferred_count": n.DeferredLen(), "producer_hex": hexOf(n.Producer()),
 		"stored_blocks": stored, "best_height": best, "state_records": records,
-		"uptime_seconds": uint64(time.Since(n.started).Seconds()), "undo_pruned": 0, "settled_height": 0,
+		"uptime_seconds": uint64(time.Since(n.started).Seconds()), "undo_pruned": undoPruned, "settled_height": settled,
 		"held_headers": headers, "replaying": false, "marked": marked, "reorganization": reorg,
 		"warnings": warnings}
 }

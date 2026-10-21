@@ -38,17 +38,87 @@ one, so:
 - the single-sided nodes the hash definition places between a parent and a
   deeper split are not stored; they are computed while hashing;
 - large batches rehash the top levels in parallel;
-- `Build` constructs a tree from sorted records in O(n) for snapshots.
+- `Build` constructs a tree from sorted records in O(n).
 
 During execution an `Overlay` layers writes over the parent's tree with an
 undo journal: an invocation's checkpoint is a journal position, rollback pops
 entries (§24.2). At the end of a block the overlay's net writes are applied
 to the tree in one batch.
 
-The chain keeps states for the last `RetainDepth` blocks (default 128) and
-every `CheckpointInterval`-th canonical block (default 1000). A block whose
-parent state was dropped is validated after re-executing stored blocks from
-the nearest retained ancestor.
+A tree can also rest on a stored tree, a `state.Source`. Its unchanged
+subtrees are then *stubs*: a node that carries only its hash, split and a key
+below it, and loads its children from the source when a change, a proof or a
+walk needs them. Each load checks that the stored children hash to the stub's
+hash. A record below a stub is read from the source's flat record table, in
+one lookup, without walking stored nodes. `state.Delta` computes what
+replacing a stored tree with a tree derived from it writes:
+
+- every branch the new tree holds in memory, all of them new;
+- the positions of the old tree's branches, on the paths of the changed keys,
+  that the new tree no longer has.
+
+A branch is stored by its position, its split bit and the key bits above it,
+so the database holds exactly the current tree, with nothing to collect.
+
+### With a database
+
+`internal/db` is an embedded bbolt file (a B+tree, like the reference's
+redb) with these tables:
+
+- records;
+- branch nodes by position;
+- each flushed block's undo data;
+- a row per stored block (its header, sizes and frame location);
+- the transaction-occurrence and event indexes;
+- metadata: format, ChainId, the base, the block-file cursor and the undo
+  floor.
+
+It changes only in atomic, durable transactions.
+
+The chain keeps the state of one canonical block, the **base**, in the
+database. In memory it keeps the states of the blocks above it, each a tree
+resting on the stored one, and each block's change list. When the tip is twice
+`RetainDepth` (128) above the base, one commit moves the base to `RetainDepth`
+below the tip. That commit holds:
+
+- the blocks' net record changes and branch deltas;
+- their undo data (each changed record's previous value);
+- their index rows;
+- rows for the blocks stored since the last commit, and the new block-file
+  cursor.
+
+The block files are forced to disk first. The trees left in memory are then
+rebuilt on the new base from the change lists, and every root is checked
+against its header.
+
+A reorganization that forks below the base first applies undo data back to the
+fork, checking each root on the way, and commits that as the new base. The new
+branch then executes as any other. Undo data is kept for 43,200 blocks below
+the base.
+
+Views read the database as it is rather than a pinned snapshot. That is
+correct for every tree whose block descends from the base: moving the base
+forward along a tree's branch never changes what its stubs stand for. A rewind
+increments an epoch, and views from before it refuse to read. A state the API
+derives across a rewind is not kept.
+
+Restart reads the metadata, rebuilds the block index from the stored-block
+rows without reading the block files, scans only the frames after the cursor,
+and attaches the base's stored state, checked against its header's root. Only
+the blocks above the base execute again, and none at all after a clean stop or
+`init`, which settle the base at the tip.
+
+The transaction and event indexes are written for flushed blocks and filtered
+by the canonical chain when read, so a reorganization never deletes rows. The
+node indexes in memory only the blocks above the base.
+
+### Without a database
+
+The chain keeps states for the last `RetainDepth` blocks and every
+`CheckpointInterval`-th canonical block (default 1000). A block whose parent
+state was dropped is validated after re-executing stored blocks from the
+nearest retained ancestor. Tests, the conformance runner and the replay tools
+use this mode.
 
 ## The VM
 
@@ -127,19 +197,11 @@ fails is passed over and its block fetched again. Files made for another
 genesis are refused. On load, blocks stored before their parents (bodies
 arrive out of order) are retried until no more connect.
 
-A running node writes a state snapshot (`state.snap`) every 1,000 blocks,
-taken 64 blocks below the tip:
-
-- Every record is written in key order, to a temporary file that is then
-  renamed.
-- On restart, the snapshot is accepted only if its records hash to the state
-  root of the block it names.
-- Blocks up to that block have their header rules and body commitments
-  re-checked but are not re-executed. Later blocks are validated in full.
-- Snapshots are the node's own records of blocks it validated; they never come
-  from peers.
-
-Measured: a 509,750-block development chain restarts in about 2 s.
+With a database, frames are forced to disk before every commit that moves
+the base past them, and otherwise at most 2 s after they are written; a frame
+lost in a crash lies above the base and is fetched again. The database
+(below) replaces the state snapshots earlier versions wrote; `ting replay
+-snapshot` and `ting snapshot` remain as tools.
 
 The pool and the deferred set (`node/txpool.go`) follow the reference node's
 policy:
@@ -218,7 +280,13 @@ Scales:
 - ordered commitments, state rehashing and nonce search use all cores;
 - execution depth is bounded by budgets, not the Go stack;
 - a cheap low-work branch costs neither memory nor execution (threshold and
-  presync), and side branches are executed only when they become the best.
+  presync), and side branches are executed only when they become the best;
+- linear memory comes from a pool by size class and is zeroed when an
+  invocation ends, and memories above 64 MiB are mapped outside the Go heap
+  (allocating a module's whole declared memory for every call had kept the
+  garbage collector busier than the interpreter);
+- with a database, memory holds the window above the base, the header index
+  and caches, and restart time depends on the window, not the chain.
 
 Measured on an Apple M3:
 
@@ -228,11 +296,16 @@ Measured on an Apple M3:
 - Validating blocks of storage-writing transactions runs at about 120,000
   transactions per second.
 
+Measured on the production chain (538 blocks): `init` imports the seed in
+2.0 s; a restart takes about 20 ms and 45 MB resident. The chain processes
+about 7,400 small blocks a second in memory and 3,300 with the database.
+Syncing from one peer is capped near 100 small blocks a second by the peer
+protocol's request units (200 a second, 2 per `raw`), as with the reference
+node; more peers multiply it.
+
 Not yet:
 
-- The state and the header index live in memory, and the transaction and event
-  indexes are rebuilt at start. The reference keeps them in a database with
-  undo data, so restart time does not depend on chain length. Snapshots bound
-  restart time here.
+- Every header stays in memory (about 500 bytes each). The reference keeps
+  only the headers above a settled height in memory.
 - The interpreter checks compute before every instruction. Charging per
   straight-line run, or a register form, would speed it up.
