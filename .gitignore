@@ -1,0 +1,27 @@
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+
+# Profiles and coverage
+*.prof
+*.pprof
+cover*.html
+coverage.txt
+
+# Node data directories and their files, wherever a run leaves them
+/data/
+/.ting/
+node.log
+control.token
+runtime.json
+node.lock
+*.snap
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
