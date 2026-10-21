@@ -65,8 +65,10 @@ func TestOperatorMarks(t *testing.T) {
 	if c.Tip().Height != 2 || len(c.Marks()) != 2 {
 		t.Fatalf("after restart: tip %d, %d marks", c.Tip().Height, len(c.Marks()))
 	}
-	// Reconsidering clears the mark and connects the stored branch again.
-	if n, err := c.Reconsider(id(2)); err != nil || n != 0 {
+	// Reconsidering clears the mark and connects the stored branch again:
+	// the marked block and the one above it, indexed after the restart as
+	// before it.
+	if n, err := c.Reconsider(id(2)); err != nil || n != 2 {
 		t.Fatalf("reconsider: %d %v", n, err)
 	}
 	if c.Tip().Height != 4 {

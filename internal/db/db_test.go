@@ -117,3 +117,32 @@ func TestUndoEncoding(t *testing.T) {
 		t.Fatal("trailing byte accepted")
 	}
 }
+
+// Undo data a replay rebuilt goes in below the floor, which is lowered
+// once all of it is in, never raised.
+func TestRestoreUndo(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "chain.db"), hashing.Hash{9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.Commit(&Commit{UndoFloor: 50}); err != nil {
+		t.Fatal(err)
+	}
+	prev := []state.Change{{Key: state.Key{1}, Value: []byte{2}}, {Key: state.Key{3}, Delete: true}}
+	if err := d.PutUndo([]BlockUndo{{Height: 10, Block: hashing.Hash{10}, Prev: prev}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := d.Undo(10, hashing.Hash{10}); !ok || err != nil || len(got) != 2 || !got[1].Delete {
+		t.Fatalf("restored undo: %v %v %v", got, ok, err)
+	}
+	if err := d.LowerUndoFloor(10); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.LowerUndoFloor(30); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := d.UndoFloor(); f != 10 {
+		t.Fatalf("floor %d, want 10", f)
+	}
+}

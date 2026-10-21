@@ -194,6 +194,9 @@ func (c *Chain) maybeFlush() error {
 		return nil
 	}
 	if err := c.flush(target); err != nil {
+		if errors.Is(err, errBodyLost) {
+			return nil // the base moves once the block is stored again
+		}
 		return c.storageFail(err)
 	}
 	return nil
@@ -215,6 +218,9 @@ func (c *Chain) Settle() error {
 		return nil
 	}
 	if err := c.flush(tip); err != nil {
+		if errors.Is(err, errBodyLost) {
+			return nil // a restart executes the blocks above the base again
+		}
 		return c.storageFail(err)
 	}
 	return nil
@@ -256,13 +262,10 @@ func (c *Chain) flush(target *Entry) (err error) {
 			}
 			t, changes = res.State, res.Changes
 		}
-		u := db.BlockUndo{Height: b.Height, Block: b.ID, Prev: make([]state.Change, len(changes))}
-		for j, ch := range changes {
-			v, ok := prev.Get(ch.Key)
-			u.Prev[j] = state.Change{Key: ch.Key, Value: v, Delete: !ok}
+		for _, ch := range changes {
 			keys[ch.Key] = struct{}{}
 		}
-		undo = append(undo, u)
+		undo = append(undo, undoFor(prev, b, changes))
 		occ, events, err := c.indexRows(b)
 		if err != nil {
 			return err
@@ -276,7 +279,8 @@ func (c *Chain) flush(target *Entry) (err error) {
 	commit := c.commitFor(baseTree, t, keys, target)
 	commit.Undo = undo
 	commit.Occurrences, commit.Events = occurrences, eventRows
-	if target.Height > c.cfg.UndoWindow {
+	// Nothing is pruned while a replay restores what was.
+	if c.replay == nil && target.Height > c.cfg.UndoWindow {
 		commit.UndoFloor = target.Height - c.cfg.UndoWindow
 	}
 	end, listed := c.listFrames(commit)
@@ -291,6 +295,17 @@ func (c *Chain) flush(target *Entry) (err error) {
 		c.store.(*FileStore).Trim(end)
 	}
 	return c.rebase(target, commit.Base)
+}
+
+// undoFor is a block's undo data: the value before it, in prev, of every
+// record it changed.
+func undoFor(prev state.Tree, b *Entry, changes []state.Change) db.BlockUndo {
+	u := db.BlockUndo{Height: b.Height, Block: b.ID, Prev: make([]state.Change, len(changes))}
+	for j, ch := range changes {
+		v, ok := prev.Get(ch.Key)
+		u.Prev[j] = state.Change{Key: ch.Key, Value: v, Delete: !ok}
+	}
+	return u
 }
 
 // commitFor is the commit that stores t, derived from the stored tree old,
@@ -311,15 +326,13 @@ func (c *Chain) commitFor(old, t state.Tree, keys map[state.Key]struct{}, at *En
 		Records: records, Puts: puts, Dels: dels}
 }
 
-// reexecute runs a stored block again on its parent's state.
+// reexecute runs a stored block again on its parent's state. Called with
+// processMu held.
 func (c *Chain) reexecute(parent state.Tree, b *Entry) (*exec.Result, error) {
-	raw, err := c.store.Get(b.ID)
+	raw, body, err := c.readBody(b)
 	if err != nil {
-		return nil, fmt.Errorf("reading stored block %s: %w", b.ID, err)
-	}
-	body, err := types.DecodeBody(raw[types.HeaderSize:])
-	if err != nil {
-		return nil, fmt.Errorf("stored block %s: %w", b.ID, err)
+		c.forgetBody(b, err)
+		return nil, fmt.Errorf("block at height %d: %w", b.Height, errBodyLost)
 	}
 	res, err := c.executeBody(parent, b.Header, b.ID, raw, body, b.Vote.Limits)
 	if err != nil {
@@ -383,14 +396,28 @@ func descends(e, a *Entry) bool {
 	return e == a
 }
 
+// missingUndo reports a block whose undo data a rewind needs and the
+// database does not hold.
+type missingUndo struct{ height uint64 }
+
+func (m *missingUndo) Error() string {
+	return fmt.Sprintf("the database holds no undo data for the block at height %d", m.height)
+}
+
 // rewind moves the base down to to, an ancestor of it, with the stored undo
-// data. Called with processMu held.
+// data; nothing changes when some is missing (*missingUndo). Called with
+// processMu held.
 func (c *Chain) rewind(to *Entry) (err error) {
 	defer state.Recover(&err)
 	c.mu.RLock()
 	base := c.base
-	baseTree := *base.state
 	c.mu.RUnlock()
+	// The stored state, which the base's own may no longer be kept as: an
+	// operator's mark below the base drops the states above the mark.
+	baseTree, err := c.storedTree()
+	if err != nil {
+		return err
+	}
 	t := baseTree
 	keys := map[state.Key]struct{}{}
 	var drop []db.BlockUndo
@@ -400,7 +427,7 @@ func (c *Chain) rewind(to *Entry) (err error) {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("a reorganization to height %d goes below the database's undo data", to.Height)
+			return &missingUndo{height: b.Height}
 		}
 		t = t.Apply(prev)
 		if t.Root() != stateRootOf(b.Parent) {
@@ -421,6 +448,15 @@ func (c *Chain) rewind(to *Entry) (err error) {
 		return err
 	}
 	return c.rebase(to, commit.Base)
+}
+
+// storedTree is the state the database holds: the base's.
+func (c *Chain) storedTree() (state.Tree, error) {
+	b, ok, err := c.cfg.State.Base()
+	if err != nil || !ok {
+		return state.Empty, err
+	}
+	return state.FromRoot(b.Root, int(b.Count), c.cfg.State.View()), nil
 }
 
 // commonAncestor is the latest block both a and b descend from.
@@ -447,14 +483,12 @@ func (c *Chain) syncBlocks() error {
 }
 
 // indexRows are the occurrence and event index rows of a stored block.
+// Called with processMu held.
 func (c *Chain) indexRows(b *Entry) ([]db.Occurrence, []db.EventRow, error) {
-	raw, err := c.store.Get(b.ID)
+	_, body, err := c.readBody(b)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading stored block %s: %w", b.ID, err)
-	}
-	body, err := types.DecodeBody(raw[types.HeaderSize:])
-	if err != nil {
-		return nil, nil, fmt.Errorf("stored block %s: %w", b.ID, err)
+		c.forgetBody(b, err)
+		return nil, nil, fmt.Errorf("block at height %d: %w", b.Height, errBodyLost)
 	}
 	occ := make([]db.Occurrence, len(body.Transactions))
 	var events []db.EventRow

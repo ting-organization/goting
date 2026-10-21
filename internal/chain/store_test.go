@@ -114,3 +114,50 @@ func TestBlockFilesRollOver(t *testing.T) {
 		}
 	}
 }
+
+// A forgotten block is stored again in a new frame, and a reopen that knows
+// the old frame from a database takes the new one.
+func TestBlockFilesForget(t *testing.T) {
+	g := types.DevelopmentGenesis()
+	dir := filepath.Join(t.TempDir(), "blocks")
+	src := newChain(t, nil)
+	raws := mineEmpty(t, src, 3, g.GenesisTimestamp+60, 60, "forget")
+	ids := make([]hashing.Hash, len(raws))
+	s, err := chain.OpenFileStore(dir, g.ChainID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, raw := range raws {
+		ids[i] = types.HeaderIDFromBytes(raw[:types.HeaderSize])
+		if err := s.Put(ids[i], raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A database lists the frames written so far.
+	known, cursor := s.FramesAfter(chain.Cursor{}), s.End()
+	s.Forget(ids[1])
+	if _, err := s.Get(ids[1]); !errors.Is(err, chain.ErrNotFound) || s.Has(ids[1]) {
+		t.Fatalf("forgotten block still read: %v", err)
+	}
+	if err := s.Put(ids[1], raws[1]); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	// Damage the old frame: only the new one reads.
+	f, _ := os.OpenFile(filepath.Join(dir, "00000000.dat"), os.O_RDWR, 0)
+	f.WriteAt([]byte{0xff, 0xff}, known[1].Location.Offset+10)
+	f.Close()
+	s, err = chain.OpenFileStoreFrom(dir, g.ChainID(), cursor, known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i, id := range ids {
+		if raw, err := s.Get(id); err != nil || string(raw) != string(raws[i]) {
+			t.Fatalf("block %d after reopening: %v", i, err)
+		}
+	}
+	if after := s.FramesAfter(cursor); len(after) != 1 || after[0].ID != ids[1] {
+		t.Fatalf("frames after the cursor: %v", after)
+	}
+}

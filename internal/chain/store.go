@@ -18,6 +18,9 @@ import (
 // ErrNotFound reports a block the store does not hold.
 var ErrNotFound = errors.New("block not found")
 
+// ErrClosed reports a use of block files after they were closed.
+var ErrClosed = errors.New("block files are closed")
+
 // BlockStore keeps raw blocks by BlockId. Storage layout is a node's own
 // business (rules §27.4).
 type BlockStore interface {
@@ -28,6 +31,9 @@ type BlockStore interface {
 	Each(fn func(id hashing.Hash, raw []byte) error) error
 	// Len returns how many blocks are stored.
 	Len() int
+	// Forget drops a block, as when its stored copy no longer reads: it is
+	// stored again by the next Put.
+	Forget(id hashing.Hash)
 	Close() error
 }
 
@@ -85,6 +91,21 @@ func (s *MemStore) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.m)
+}
+
+func (s *MemStore) Forget(id hashing.Hash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[id]; !ok {
+		return
+	}
+	delete(s.m, id)
+	for i, o := range s.order {
+		if o == id {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
 }
 
 func (s *MemStore) Close() error { return nil }
@@ -196,7 +217,7 @@ func OpenFileStoreFrom(dir string, chainID hashing.Hash, from Cursor, known []Fr
 		case uint32(n) == from.Segment && from.Offset > segmentHead:
 			start = from.Offset
 		}
-		size, err := s.scan(n, f, start)
+		size, err := s.scan(n, f, start, from)
 		if err != nil {
 			s.Close()
 			return nil, err
@@ -222,7 +243,7 @@ func (s *FileStore) segPath(n int) string {
 // scan indexes one segment's frames and returns where its valid frames end.
 // A damaged frame ends the scan; in the last segment it is truncated with
 // everything after it.
-func (s *FileStore) scan(n int, f *os.File, start int64) (int64, error) {
+func (s *FileStore) scan(n int, f *os.File, start int64, from Cursor) (int64, error) {
 	head := make([]byte, segmentHead)
 	if _, err := io.ReadFull(f, head); err != nil || string(head[:8]) != segmentMagic {
 		return 0, fmt.Errorf("%s: not a block file", s.segPath(n))
@@ -270,8 +291,11 @@ func (s *FileStore) scan(n int, f *os.File, start int64) (int64, error) {
 			break
 		}
 		id := types.HeaderIDFromBytes(raw[:types.HeaderSize])
-		if _, dup := s.index[id]; !dup {
-			s.index[id] = location{seg: n, offset: off + 8, length: int64(n64)}
+		// A block is stored twice only when its first frame was forgotten
+		// for no longer reading: the later frame stands for it.
+		old, dup := s.index[id]
+		s.index[id] = location{seg: n, offset: off + 8, length: int64(n64)}
+		if !dup || from.covers(old) {
 			s.order = append(s.order, id)
 		}
 		off += 8 + int64(n64) + 32
@@ -322,6 +346,9 @@ func (s *FileStore) Put(id hashing.Hash, raw []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.files == nil {
+		return ErrClosed
+	}
 	if _, ok := s.index[id]; ok {
 		return nil
 	}
@@ -380,12 +407,18 @@ func (s *FileStore) Get(id hashing.Hash) ([]byte, error) {
 	s.mu.Lock()
 	loc, ok := s.index[id]
 	var f *os.File
-	if ok {
+	if ok && loc.seg < len(s.files) {
 		f = s.files[loc.seg]
 	}
+	closed := s.files == nil
 	s.mu.Unlock()
-	if !ok {
+	switch {
+	case closed:
+		return nil, ErrClosed
+	case !ok:
 		return nil, ErrNotFound
+	case f == nil:
+		return nil, fmt.Errorf("stored block %s: segment %d is missing", id, loc.seg)
 	}
 	b := make([]byte, loc.length+32)
 	if _, err := f.ReadAt(b, loc.offset); err != nil {
@@ -396,6 +429,24 @@ func (s *FileStore) Get(id hashing.Hash) ([]byte, error) {
 		return nil, fmt.Errorf("stored block %s: checksum mismatch", id)
 	}
 	return raw, nil
+}
+
+// Forget drops a block whose frame no longer reads: it is no longer served,
+// and storing it again writes a new frame. The old frame stays in its file,
+// unreferenced.
+func (s *FileStore) Forget(id hashing.Hash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.index[id]; !ok {
+		return
+	}
+	delete(s.index, id)
+	for i, o := range s.order {
+		if o == id {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
 }
 
 func (s *FileStore) Has(id hashing.Hash) bool {

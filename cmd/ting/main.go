@@ -396,6 +396,7 @@ func cmdNode(args []string) error {
 		stop()
 	}
 	ccfg := chain.DefaultConfig()
+	ccfg.Log = log
 	if *data != "" {
 		ccfg.MarksPath = filepath.Join(*data, "marks.json")
 		ccfg.State = database
@@ -479,6 +480,7 @@ func cmdNode(args []string) error {
 	log.Info("node running", "chain_id", c.ChainID().String(), "height", c.Tip().Height, "mine", *mine,
 		"peers", connect, "listen", *listen)
 	nd.Run(ctx)
+	c.Close()
 	if err := c.Settle(); err != nil {
 		log.Error("settling the state", "err", err)
 	}
