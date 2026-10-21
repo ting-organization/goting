@@ -94,6 +94,9 @@ func Open(path string, chainID hashing.Hash) (*DB, error) {
 // Close closes the database.
 func (d *DB) Close() error { return d.bolt.Close() }
 
+// Path returns the database file's path.
+func (d *DB) Path() string { return d.bolt.Path() }
+
 func undoKey(height uint64, id hashing.Hash) []byte {
 	return append(binary.BigEndian.AppendUint64(nil, height), id[:]...)
 }
@@ -232,6 +235,35 @@ func (d *DB) UndoFloor() (uint64, error) {
 		return nil
 	})
 	return floor, err
+}
+
+// PutUndo stores undo data that a replay rebuilt below the undo floor; the
+// floor is lowered once all of it is stored (LowerUndoFloor).
+func (d *DB) PutUndo(undo []BlockUndo) error {
+	if len(undo) == 0 {
+		return nil
+	}
+	return d.bolt.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUndo)
+		for _, u := range undo {
+			if err := b.Put(undoKey(u.Height, u.Block), encodeUndo(u.Prev)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// LowerUndoFloor records that undo data is held again from floor up, as after
+// a replay stored what was pruned. A floor already as low stays.
+func (d *DB) LowerUndoFloor(floor uint64) error {
+	return d.bolt.Update(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		if v := meta.Get(metaUndoFloor); len(v) != 8 || binary.BigEndian.Uint64(v) <= floor {
+			return nil
+		}
+		return meta.Put(metaUndoFloor, binary.BigEndian.AppendUint64(nil, floor))
+	})
 }
 
 // BlockRow is a stored block as the database lists it, so that a restart

@@ -96,6 +96,17 @@ fork, checking each root on the way, and commits that as the new base. The new
 branch then executes as any other. Undo data is kept for 43,200 blocks below
 the base.
 
+A branch that forks below that window needs undo data the database no longer
+holds (`chain/replay.go`, after the reference's deep reorganizations). The
+node then keeps following the best branch it can connect, and in the
+background replays the base's ancestors from genesis into `replay/chain.db`,
+checking every state root and keeping the undo data of each block above the
+fork. That undo data is copied into the database a step at a time, the undo
+floor is lowered, and the reorganization goes on. Nothing is pruned while a
+replay runs; a failed one is tried again a minute later at the earliest, and a
+restart starts it again. The status reports `replaying` meanwhile. An
+operator's mark below the window takes the base down the same way.
+
 Views read the database as it is rather than a pinned snapshot. That is
 correct for every tree whose block descends from the base: moving the base
 forward along a tree's branch never changes what its stubs stand for. A rewind
@@ -199,7 +210,15 @@ arrive out of order) are retried until no more connect.
 
 With a database, frames are forced to disk before every commit that moves
 the base past them, and otherwise at most 2 s after they are written; a frame
-lost in a crash lies above the base and is fetched again. The database
+lost in a crash lies above the base and is fetched again.
+
+A block whose frame fails when it is read later, for executing it,
+re-deriving a state, moving the base or a replay, is forgotten and fetched
+again rather than stopping the node, as in the reference. A block not yet
+executed goes back to a header, so no branch through it connects until it is
+stored again. An executed one stays valid and is fetched before any other
+block, and the base waits for it. The block is stored again in a new frame,
+which a restart reads in place of the one the database lists. The database
 (below) replaces the state snapshots earlier versions wrote; `ting replay
 -snapshot` and `ting snapshot` remain as tools.
 

@@ -622,7 +622,7 @@ None of these affects which blocks are valid.
 |---|---|---|
 | State storage | redb database with records, tree nodes and per-block undo/redo; every block committed; undo pruned to `undo_window` | bbolt database with records, tree nodes and undo data (no redo); the base trails the tip by 128–256 blocks and moves in one commit; undo kept for `undo_window` blocks below the base (43,200; 0 keeps all); `db_cache_mib` accepted but unused, the operating system's page cache serving instead |
 | Header index | held headers above a settled height; older ones in the database | every header in memory, restored from the database's block rows at start |
-| Deep reorganizations | below the undo window, replay from genesis in the background | below the undo window, refused |
+| Deep reorganizations | below the undo window, replay from genesis in the background; the node stays on its tip | the same, into `replay/chain.db`; the node follows the best branch it can connect meanwhile |
 | Explorer | served at `/`, `/blocks`, `/blocks/{id}`, `/transactions/{id}`, `/contracts/{id}`, `/mempool` | its own explorer at the same paths, plus `/network` and `/insights` |
 | Wiki, Swagger UI, `/openapi.json`, `ting docs` | served | not served |
 | Status | published every 0.2 s; `/health` answers 504 when that is older than 30 s | computed per request; `settled_height` is the database's base |
@@ -768,6 +768,52 @@ no longer kept: the chain counts rewinds and compares before keeping one.
 **Not done yet:**
 
 - every header stays in memory;
-- `db_cache_mib` is accepted but unused;
-- a reorganization below the undo window is refused, where the reference
-  replays from genesis in the background.
+- `db_cache_mib` is accepted but unused.
+
+## Stage 3, continued: deep rollbacks and damaged blocks
+
+A review of how the node copes with far rollbacks and with storage trouble,
+by experiment against the code.
+
+### What held
+
+| Experiment | Result |
+|---|---|
+| 1,000-block reorganization forking below the base | correct state at every step; about 50 ms on a small state; back again too |
+| 1,600-block fork deeper than the 1,440-block work threshold, synced through the header pre-sync | one round; 1,403 blocks undone below the base; 83 ms |
+| `kill -9` at 35 random points while processing 2,500 blocks with a 1,200-block reorganization | every restart resumed and ended on the right tip and state root |
+| 45 s of fuzzing each: block, transaction and receipt decoders, the WASM decoder, the VM, the peer messages | about 9 million inputs, no panic |
+
+### What failed, and the fixes
+
+- **A branch forking below the undo window stopped the node for good.** The
+  rewind found no undo data and reported a storage failure, and every
+  restart failed to load with the same error. The node now replays from
+  genesis to rebuild the undo data, as the reference does (ARCHITECTURE.md,
+  "With a database").
+- **One damaged block above the base kept the node from loading.** Executing
+  it failed on its checksum, every restart again, and offering the block
+  again did nothing, since the node held it already. The block is now
+  forgotten and fetched again, as in the reference.
+- **The operator's mark on a block below the base crashed the node.** Marking
+  drops the states above the mark, the base's included, and the rewind read
+  the base's state: a nil pointer. The rewind now starts from the stored
+  state.
+- **After a restart, marks kept the blocks above them out of the index.**
+  Reconsidering a mark then brought back only the blocks written after the
+  database's cursor; the others had to be fetched again. Marks now apply once
+  the stored blocks are indexed, as when they were made, and a base above a
+  marked block (a restart before the replay that takes it down) still loads.
+- **A read of closed block files panicked** instead of failing. It now
+  returns `ErrClosed`.
+
+**How it was tested:** chain tests of each case, in `recovery_test.go`: a
+block damaged above the base found at a restart, and in the window when the
+base moves; a fork below the undo window, also when the replay happens only
+after a restart, with the tip on the connectable branch meanwhile; a mark
+below the window, with and without a restart; reconsidering a mark after a
+restart. `FuzzMessages` now fuzzes the peer messages for good: they decode
+without panicking and re-encode to the same bytes. The whole suite passes
+with `-race`, which links again since Pebble went. The experiments above were run again on the fixed code, with 26 more
+`kill -9` points; and a production node synced from node2 to height 590 with
+the same state root, stopped cleanly and restarted at its tip in 1 ms.

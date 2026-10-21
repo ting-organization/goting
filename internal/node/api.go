@@ -458,7 +458,7 @@ func (n *Node) Status() map[string]any {
 		"deferred_count": n.DeferredLen(), "producer_hex": hexOf(n.Producer()),
 		"stored_blocks": stored, "best_height": best, "state_records": records,
 		"uptime_seconds": uint64(time.Since(n.started).Seconds()), "undo_pruned": undoPruned, "settled_height": settled,
-		"held_headers": headers, "replaying": false, "marked": marked, "reorganization": reorg,
+		"held_headers": headers, "replaying": c.Replaying(), "marked": marked, "reorganization": reorg,
 		"warnings": warnings}
 }
 

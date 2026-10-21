@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -107,6 +109,9 @@ type Config struct {
 	// Fatal is told of a failure of the node's own storage, after which the
 	// chain processes no more blocks.
 	Fatal func(error)
+	// Log receives what an operator should know: a block fetched again, a
+	// replay of the chain (replay.go). Nothing is logged when nil.
+	Log *slog.Logger
 }
 
 // DefaultConfig returns sensible defaults.
@@ -208,6 +213,17 @@ type Chain struct {
 	// rewinds counts rewinds of the base: a state derived across one is
 	// not kept.
 	rewinds uint64
+	// lost holds executed blocks whose stored bodies no longer read; they
+	// are fetched again before any other.
+	lost map[hashing.Hash]*Entry
+	// replay rebuilds pruned undo data (replay.go); guarded by processMu
+	// and, for reading alone, by mu.
+	replay       *replay
+	replayFailed time.Time
+	closed       bool
+	// loading indexes stored blocks whatever the operator's marks, which
+	// Load then applies.
+	loading bool
 }
 
 // NoSeed, passed as a seed list, makes a private chain with no seed heights
@@ -229,6 +245,9 @@ func New(g *types.GenesisConfig, seed []hashing.Hash, store BlockStore, cfg Conf
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
+	}
+	if cfg.Log == nil {
+		cfg.Log = slog.New(slog.DiscardHandler)
 	}
 	chainID := g.ChainID()
 	gid := types.GenesisBlockID(chainID)
@@ -269,6 +288,7 @@ func New(g *types.GenesisConfig, seed []hashing.Hash, store BlockStore, cfg Conf
 		offenders:  map[string]struct{}{},
 		retained:   map[*Entry]struct{}{gen: {}},
 		subs:       map[chan Event]struct{}{},
+		lost:       map[hashing.Hash]*Entry{},
 	}
 	if err := c.loadMarks(); err != nil {
 		return nil, err
@@ -474,7 +494,7 @@ func (c *Chain) acceptHeader(h *types.Header, id hashing.Hash, recovered, noThre
 	reason, bad := c.invalid[id]
 	_, marked := c.marks[id]
 	c.mu.RUnlock()
-	if marked {
+	if marked && !c.loading {
 		return nil, ErrMarked
 	}
 	if bad && !c.listedAs(h, id) {
@@ -676,6 +696,7 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 	h, _ := types.DecodeHeader(raw[:types.HeaderSize])
 	c.mu.RLock()
 	e, indexed := c.entries[id]
+	_, lost := c.lost[id]
 	c.mu.RUnlock()
 	switch {
 	case indexed && e.Status == StatusInvalid:
@@ -687,10 +708,10 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 		}
 		reason, _ := c.InvalidReason(id)
 		return e, false, &InvalidError{Height: h.Height, ID: id, Reason: "it failed validation: " + reason}
-	case indexed && e.HasData():
+	case indexed && e.HasData() && !lost:
 		return e, true, nil
 	case indexed:
-		if !recovered && h.Timestamp > c.now()+ClockSlack {
+		if !recovered && !lost && h.Timestamp > c.now()+ClockSlack {
 			return nil, false, ErrAhead
 		}
 	default:
@@ -721,6 +742,7 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 	e.TxCount = len(body.Transactions)
 	e.Size = len(raw)
 	delete(c.inFlight, id)
+	delete(c.lost, id)
 	c.markComplete(e)
 	c.advanceFrontier()
 	c.mu.Unlock()
@@ -770,25 +792,84 @@ func (c *Chain) markInvalid(e *Entry, err error) []*Entry {
 		delete(c.retained, n)
 		delete(c.heads, n)
 		delete(c.inFlight, n.ID)
+		delete(c.lost, n.ID)
 		stack = append(stack, n.children...)
 	}
-	// The parent is a head again unless another valid child continues it.
-	p := e.Parent
-	if p.complete && p.Status != StatusInvalid {
-		alone := true
-		for _, ch := range p.children {
-			if ch.complete && ch.Status != StatusInvalid {
-				alone = false
-			}
-		}
-		if alone {
-			c.heads[p] = struct{}{}
-		}
-	}
+	c.rehead(e.Parent)
 	if c.best.Status == StatusInvalid {
 		c.recomputeBest()
 	}
 	return marked
+}
+
+// rehead makes p a head again unless a complete child continues it. Called
+// with c.mu held.
+func (c *Chain) rehead(p *Entry) {
+	if !p.complete || p.Status == StatusInvalid {
+		return
+	}
+	for _, ch := range p.children {
+		if ch.complete && ch.Status != StatusInvalid {
+			return
+		}
+	}
+	c.heads[p] = struct{}{}
+}
+
+// readBody reads a stored block and decodes its body.
+func (c *Chain) readBody(e *Entry) ([]byte, *types.Body, error) {
+	raw, err := c.store.Get(e.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(raw) < types.HeaderSize {
+		return nil, nil, fmt.Errorf("stored block %s is truncated", e.ID)
+	}
+	body, err := types.DecodeBody(raw[types.HeaderSize:])
+	if err != nil {
+		return nil, nil, fmt.Errorf("stored block %s: %w", e.ID, err)
+	}
+	return raw, body, nil
+}
+
+// errBodyLost reports that a stored block no longer reads: it is fetched
+// again, and what needs it waits.
+var errBodyLost = errors.New("a stored block no longer reads and is fetched again")
+
+// forgetBody drops a stored block whose body no longer reads, as a damaged
+// frame leaves it (reference node, wiki: node/storage): its header stays and
+// its body is fetched again. An executed block stays valid and is fetched
+// before any other; a branch through a block not executed is not connected
+// until the block is stored again. Called with processMu held.
+func (c *Chain) forgetBody(e *Entry, err error) {
+	c.store.Forget(e.ID)
+	c.cfg.Log.Warn("stored block cannot be read; it is fetched again", "height", e.Height, "id", e.ID.String(), "err", err)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch e.Status {
+	case StatusValid:
+		c.lost[e.ID] = e
+		return
+	case StatusStored:
+	default:
+		return
+	}
+	e.Status = StatusHeader
+	stack := []*Entry{e}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if !n.complete {
+			continue
+		}
+		n.complete = false
+		delete(c.heads, n)
+		stack = append(stack, n.children...)
+	}
+	c.rehead(e.Parent)
+	if int(e.Height) < len(c.bestPath) && c.bestPath[e.Height] == e && int(e.Height) < c.frontier {
+		c.frontier = int(e.Height)
+	}
 }
 
 // overtakes is the fork-choice margin (rules §8.2, reference policy): a
@@ -808,13 +889,15 @@ func isAncestor(a, b *Entry) bool {
 	return b == a
 }
 
-// choose picks the branch to move toward: of the complete heads, most work
-// first, the first that is the start tip, grows it with more work, or clears
-// the margin against it. Called with c.mu held.
-func (c *Chain) choose(start *Entry, startWork *big.Int) *Entry {
+// choose picks the branch to move toward: of the complete heads but those
+// that wait, most work first, the first that is the start tip, grows it with
+// more work, or clears the margin against it. Called with c.mu held.
+func (c *Chain) choose(start *Entry, startWork *big.Int, waiting map[*Entry]bool) *Entry {
 	heads := make([]*Entry, 0, len(c.heads))
 	for h := range c.heads {
-		heads = append(heads, h)
+		if !waiting[h] {
+			heads = append(heads, h)
+		}
 	}
 	sort.Slice(heads, func(i, j int) bool { return better(heads[i], heads[j]) })
 	for _, h := range heads {
@@ -834,15 +917,23 @@ func (c *Chain) activate() error {
 	start := c.tip
 	startWork := new(big.Int).Set(start.ChainWork)
 	c.mu.RUnlock()
+	// Branches that wait for undo data to be rebuilt or for a block to be
+	// stored again: the best of the others is followed meanwhile, and the
+	// move is tried again then.
+	waiting := map[*Entry]bool{}
 	for {
 		c.mu.RLock()
-		head := c.choose(start, startWork)
+		head := c.choose(start, startWork, waiting)
 		tip := c.tip
 		c.mu.RUnlock()
 		if head == nil || head == tip {
 			return c.maybeFlush()
 		}
 		valid, err := c.connect(head)
+		if errors.Is(err, errReplaying) || errors.Is(err, errBodyLost) {
+			waiting[head] = true
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -872,8 +963,12 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 		c.mu.RLock()
 		to := commonAncestor(fork, c.base)
 		c.mu.RUnlock()
-		if err := c.rewind(to); err != nil {
-			return false, c.storageFail(err)
+		waiting, rerr := c.rewindTo(to)
+		if rerr != nil {
+			return false, c.storageFail(rerr)
+		}
+		if waiting {
+			return false, errReplaying
 		}
 		st, err = c.stateAt(fork)
 	}
@@ -882,13 +977,11 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 	}
 	for i := len(branch) - 1; i >= 0; i-- {
 		b := branch[i]
-		raw, err := c.store.Get(b.ID)
+		raw, body, err := c.readBody(b)
 		if err != nil {
-			return false, fmt.Errorf("reading stored block %s: %w", b.ID, err)
-		}
-		body, err := types.DecodeBody(raw[types.HeaderSize:])
-		if err != nil {
-			return false, fmt.Errorf("stored block %s: %w", b.ID, err)
+			// The block is fetched again; the branch waits for it.
+			c.forgetBody(b, err)
+			return false, nil
 		}
 		res, err := c.executeBody(st, b.Header, b.ID, raw, body, b.Vote.Limits)
 		if err != nil {
@@ -1036,13 +1129,10 @@ func (c *Chain) stateAt(e *Entry) (state.Tree, error) {
 	var changes []state.Change
 	for i := len(path) - 1; i >= 0; i-- {
 		b := path[i]
-		raw, err := c.store.Get(b.ID)
+		raw, body, err := c.readBody(b)
 		if err != nil {
-			return state.Tree{}, fmt.Errorf("re-deriving state at height %d: %w", b.Height, err)
-		}
-		body, err := types.DecodeBody(raw[types.HeaderSize:])
-		if err != nil {
-			return state.Tree{}, fmt.Errorf("stored block %s: %w", b.ID, err)
+			c.forgetBody(b, err)
+			return state.Tree{}, fmt.Errorf("re-deriving state at height %d: %w", b.Height, errBodyLost)
 		}
 		res, err := c.executeBody(st, b.Header, b.ID, raw, body, b.Vote.Limits)
 		if err != nil {
@@ -1099,11 +1189,19 @@ func (c *Chain) NewBuilder(parent *Entry, ctx *vm.BlockContext, limits types.Res
 
 // Load re-reads every block in the store, as after a restart: each header
 // is checked again and each body against its header; the best branch is
-// then executed. Cached data never stands in for execution.
+// then executed. Cached data never stands in for execution. The operator's
+// marks apply once the stored blocks are indexed, as when they were made:
+// a base above a marked block, which a restart may find before the replay
+// that takes it down is done, still loads.
 func (c *Chain) Load() (int, error) {
 	c.processMu.Lock()
 	defer c.processMu.Unlock()
+	c.loading = true
+	defer func() { c.loading = false }()
 	if c.cfg.State != nil {
+		// What a replay cut short left is of no use: one starts again if
+		// it is still needed.
+		os.RemoveAll(c.replayDir())
 		if err := c.restoreRows(); err != nil {
 			return 0, err
 		}
@@ -1117,7 +1215,18 @@ func (c *Chain) Load() (int, error) {
 			return n, err
 		}
 	}
-	return n, c.activate()
+	c.loading = false
+	c.mu.Lock()
+	for id := range c.marks {
+		if e, ok := c.entries[id]; ok && e.Status != StatusInvalid && e != c.gen {
+			c.markInvalid(e, ErrMarked)
+		}
+	}
+	c.mu.Unlock()
+	if err := c.activate(); err != nil {
+		return n, err
+	}
+	return n, c.leaveBase()
 }
 
 // indexStored indexes the stored blocks the index does not hold. A block

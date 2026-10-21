@@ -147,6 +147,7 @@ func Run(dir string, log *slog.Logger) error {
 		log.Error("stopping: storage failure", "err", err)
 		setFatal(err)
 	}
+	ccfg.Log = log
 	c, err := chain.New(g, nil, store, ccfg)
 	if err != nil {
 		return err
@@ -237,6 +238,7 @@ func Run(dir string, log *slog.Logger) error {
 	}
 	d.mu.Unlock()
 	wg.Wait()
+	c.Close()
 	if err := c.Settle(); err != nil {
 		log.Error("settling the state", "err", err)
 	}

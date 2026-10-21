@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"time"
 
 	"github.com/ting-organization/goting/internal/consensus"
@@ -330,7 +331,8 @@ type Wanted struct {
 // BlocksWanted returns blocks along the best header's branch for peer to
 // fetch: from the lowest one not yet stored, within the window, at most 64
 // asked of this peer at once, none asked of two peers at once until its
-// transfer time passes.
+// transfer time passes. Executed blocks whose stored bodies no longer read
+// come first.
 func (c *Chain) BlocksWanted(peer string) []Wanted {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -349,21 +351,33 @@ func (c *Chain) BlocksWanted(peer string) []Wanted {
 	}
 	c.advanceFrontier()
 	var out []Wanted
-	asked := 0
-	for i := c.frontier; i < len(c.bestPath) && i < c.frontier+downloadWindow && asked < perPeer; i++ {
+	want := func(e *Entry) {
+		if f, ok := c.expired[e.ID]; ok && f.peer == peer {
+			return
+		}
+		if f, ok := c.inFlight[e.ID]; ok && f.peer != peer {
+			return
+		}
+		c.inFlight[e.ID] = flight{peer: peer, since: now}
+		out = append(out, Wanted{ID: e.ID, Max: e.Vote.Limits[types.D]})
+	}
+	lost := make([]*Entry, 0, len(c.lost))
+	for _, e := range c.lost {
+		lost = append(lost, e)
+	}
+	sort.Slice(lost, func(i, j int) bool { return lost[i].Height < lost[j].Height })
+	for _, e := range lost {
+		if len(out) >= perPeer {
+			break
+		}
+		want(e)
+	}
+	for i := c.frontier; i < len(c.bestPath) && i < c.frontier+downloadWindow && len(out) < perPeer; i++ {
 		e := c.bestPath[i]
 		if e.HasData() || e.Status == StatusInvalid {
 			continue
 		}
-		if f, ok := c.expired[e.ID]; ok && f.peer == peer {
-			continue
-		}
-		if f, ok := c.inFlight[e.ID]; ok && f.peer != peer {
-			continue
-		}
-		c.inFlight[e.ID] = flight{peer: peer, since: now}
-		out = append(out, Wanted{ID: e.ID, Max: e.Vote.Limits[types.D]})
-		asked++
+		want(e)
 	}
 	return out
 }
