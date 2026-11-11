@@ -817,3 +817,105 @@ without panicking and re-encode to the same bytes. The whole suite passes
 with `-race`, which links again since Pebble went. The experiments above were run again on the fixed code, with 26 more
 `kill -9` points; and a production node synced from node2 to height 590 with
 the same state root, stopped cleanly and restarted at its tip in 1 ms.
+
+## Stage 4: the reference's hardening, and resistance to attack
+
+Date: 2026-11-11. New input: the reference at `0c1ab39`, 50 commits past the
+one stage 3 compared with, nearly all of them node hardening found by audits
+and reviews before the network was announced. Its consensus code changed only
+in how state values are streamed; the conformance vectors, the voting chain
+and both seeds pass unchanged against it.
+
+Five read-only audits compared this node with each of those commits, one area
+each, and looked for more on their own; the claims below marked *shown* were
+reproduced on the code as it was. Every item was then fixed here.
+
+### What a peer could do, and no longer can
+
+| Attack on the code as it was | Cost to the attacker | Now |
+|---|---|---|
+| Push siblings of the tip: each stored for good, indexed, never executed, never banned | one block of work each; the reference measured 210 to 440 GB a day from one GPU | stored only when executed at once; otherwise held in memory, 16 MiB a connection and 64 MiB in all |
+| Show sibling headers through headers sync: each indexed for good | one block of work each, about 0.9 KB of memory | indexed only when the chain overtakes the best header by its own block's margin; a pre-sync keeps nothing |
+| A page of 2,000 copies of one stale header: each walked a voting epoch back under the index's write lock | one stale block's work, reusable for ever | one pre-sync a page, two walks from new fork points in 30 s, the walk reused |
+| Two blocks above the tip with bodies that do not match: headers stayed indexed, the best header two above the tip, the built-in miner waiting for good | two blocks of work | a header is indexed only once its body matches; the miner waits only while the tip or the count of stored blocks moves |
+| One address announcing 2,000 listening ports: 1,023 of the book's 1,024 places, honest unproven addresses and an unproven seed evicted (*shown*, 83 ms) | one address | 2 places an address, 32 a network group, 32 additions an hour from one group, random among equals, seeds never |
+| 100 `addresses` requests: 498 of 500 proven addresses (*shown*) | 100 request units | the same answer to every peer for an hour |
+| Nine peers that announce the real tip and serve no block take every outbound slot: the node stayed at height 0 beside an honest peer at 123 (*shown*) | nine addresses in nine /16s | peers caught lacking a block do not count; the seeds take no slot, are left only once the node has caught up, and come back with a stale tip |
+| A seed name is pointed at a new address: the old one stayed a seed's in every book for good, linked outside `max_peers` and kept through bans (found in review; the reference does the same) | the address a seed gave up | an address is a seed's only while a seed name leads to it |
+| 125 inbound connections from 125 ranges refuse every newcomer | one IPv6 /56 | eviction by network group, with the latest block deliverers and the longest connected kept |
+| A `pending` request naming one 256 KiB transaction 32 times: 8.4 MiB for 2 units | none | each id once, one slice whole, bytes charged as a block's |
+| Answering 62 pipelined requests with 16 MiB frames: about 1 GiB a connection | bandwidth | every answer bounded by what was asked for; 8 MiB of slices asked ahead |
+| One `/64` with a fresh address a submission: every other source out of the pool, all 4,096 deferred places (*shown*) | one envelope a place | shares by range: an IPv4 address or an IPv6 /64 |
+| A free failing deployment before each template, which burns the block's compute: an honest transaction not mined in ten blocks (*shown*) | nothing | ranges take turns in one queue; mined in the second block |
+| 256 connections that never read their answers: REST answers 503 to everyone for good (*shown*); 587 idle ones under a 600-file limit stop peer and control accepts until restart (*shown*) | connections | timers on headers, bodies, answers and idleness; 512 connections, 16 a client; the peer listener retries |
+| One 16 MiB body of empty reads to `POST /v1/storage`: 455 MiB; eight at once 2.6 GiB (*shown*) | 100 MiB of upload | 266,240 bytes |
+| A state read in flight during a deep reorganisation panics outside net/http's recover: the node ends | timing | recovered: the request fails, the node goes on |
+
+### Faults of the node's own that blamed others
+
+- A damaged record in the database made an honest block fail, marked it and
+  every block above it invalid for good, and banned the peer that sent it.
+  A failing block now runs once more on the stored tree alone, each record
+  checked against its leaf; passing there, the node stops with a storage
+  failure. A storage error during execution stops the node too, instead of
+  leaving it running and stuck.
+- A peer that answered `block not found` lost its pre-sync and was asked
+  again at once. The block is now not asked of it for ten seconds, the other
+  connections are told at once, and a peer at a tip as high as the best
+  header that lacks a block counts as lacking.
+- A peer that answered hello and state was marked proven and tried first
+  again every minute. Only a completed round or a delivered block proves an
+  address.
+- A new block file left zero-filled by a power loss kept the node from
+  starting, and a torn length field was allocated before it was read: up to a
+  terabyte.
+
+### Growth with the chain
+
+- Every move of the base walked the whole header index under its write lock,
+  and a long branch (a first sync with blocks present, a deep reorganisation)
+  executed whole before the base moved, with every state and change list in
+  memory. The walk is gone, a branch that extends the tip connects 256 blocks
+  at a time, and a move of the base stops at 64 MiB of undo data.
+- A block naming one transaction a thousand times cost a thousand passes when
+  it left the in-memory index; the check of recent inclusions read every row
+  of a transaction since genesis.
+- The listings of the pool's ids were sorted for every `state` and
+  `inventory` request of every peer, about nine cores at 125 connections by
+  the audit's measurement; they are now made at most five times a second.
+
+### Panics
+
+Go has no task isolation: an unrecovered panic in any goroutine ends the
+process. Every goroutine that handles a peer or a request now recovers, and
+the connection or request ends as a failed one. A panic that unwound past a
+lock taken without `defer` would leave the node hanging with its listeners up,
+which is worse than stopping, so after any recovered panic the node tries its
+locks and exits if one is still held a minute later. No panic reachable from
+peer input was found by reading the wire, message, server and backend code,
+or by the fuzzers.
+
+### Checked
+
+- Tests of each item, written to fail on the code as it was: pushed siblings,
+  runs across connections, a pusher moving within its run, headers without
+  matching bodies, sibling headers and pages of copies, a branch the best
+  header passed, the book's shares and answers, seeds through a ban, inbound
+  eviction, the miner's wait, REST's limits, the storage body limit, a panic
+  with and without a held lock, checked reads against a damaged record table,
+  block files after a power loss, and a node that leaves its seed and comes
+  back to it.
+- The whole suite with `-race`; builds for Linux, Windows and macOS.
+- Live: a new production data directory found both seeds by name and
+  synchronized from them.
+
+### Still open
+
+| Area | Reference | This node |
+|---|---|---|
+| Undo data | each value moved a MiB at a time | one block's gathered whole; a move of the base stops at 64 MiB between blocks |
+| Header index | settled headers on disk | all in memory, about 0.9 KB a block |
+| Retries of relays refused for want of room | at most a block's data capacity each way at each tip | all of them at each tip |
+| A reorganisation's requeued transactions | the node's own, never evicted | the same; a block of fillers mined and reorganised out stays pooled a day |
+| REST | answers in 64 KiB copies | whole answers buffered, at most 16 MiB a slot |
+| `/v1/transactions/{id}` | paged in the database | every occurrence read, then paged |

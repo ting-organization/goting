@@ -2,6 +2,7 @@ package chain
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -246,7 +247,26 @@ func (s *FileStore) segPath(n int) string {
 func (s *FileStore) scan(n int, f *os.File, start int64, from Cursor) (int64, error) {
 	head := make([]byte, segmentHead)
 	if _, err := io.ReadFull(f, head); err != nil || string(head[:8]) != segmentMagic {
-		return 0, fmt.Errorf("%s: not a block file", s.segPath(n))
+		// A new segment left short or zero-filled by a power loss, its
+		// header never having reached the disk: nothing the database lists
+		// lies in it, so its header is written again. Any other foreign
+		// header is refused.
+		_, next := os.Stat(s.segPath(n + 1))
+		blank := bytes.Count(head, []byte{0}) == len(head)
+		if start != segmentHead || !blank || !errors.Is(next, os.ErrNotExist) {
+			return 0, fmt.Errorf("%s: not a block file", s.segPath(n))
+		}
+		if err := f.Truncate(0); err != nil {
+			return 0, err
+		}
+		if _, err := f.WriteAt(append([]byte(segmentMagic), s.chainID[:]...), 0); err != nil {
+			return 0, err
+		}
+		if err := f.Sync(); err != nil {
+			return 0, err
+		}
+		s.Damaged++
+		return segmentHead, nil
 	}
 	if hashing.Hash(head[8:]) != s.chainID {
 		return 0, fmt.Errorf("%s: %w", s.segPath(n), ErrWrongChain)
@@ -276,8 +296,10 @@ func (s *FileStore) scan(n int, f *os.File, start int64, from Cursor) (int64, er
 			}
 			break
 		}
+		// A length is trusted only as far as the file goes: a torn one must
+		// not be allocated.
 		n64 := binary.LittleEndian.Uint64(lenBuf[:])
-		if n64 < minBlock || n64 > 1<<40 {
+		if rest := st.Size() - off - 8 - 32; n64 < minBlock || rest < 0 || n64 > uint64(rest) {
 			s.Damaged++
 			break
 		}

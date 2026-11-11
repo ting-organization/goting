@@ -168,6 +168,12 @@ type flight struct {
 	since time.Time
 }
 
+// bar names a block a peer is not asked for.
+type bar struct {
+	id   hashing.Hash
+	peer string
+}
+
 // Chain is the block tree of one network.
 type Chain struct {
 	genesis   *types.GenesisConfig
@@ -193,11 +199,16 @@ type Chain struct {
 	bestPath  []*Entry // genesis .. best, by height
 	frontier  int      // lowest height on bestPath without data
 	inFlight  map[hashing.Hash]flight
-	expired   map[hashing.Hash]flight
-	presync   map[string]*presyncState
-	retained  map[*Entry]struct{}
-	subs      map[chan Event]struct{}
-	hooks     []func(Event)
+	// barred holds, until when, the blocks not asked of a peer again: ones
+	// it let lapse, and ones it said it does not have.
+	barred map[bar]time.Time
+	// released is closed, and replaced, when blocks go back to the other
+	// peers, so that their connections ask at once.
+	released chan struct{}
+	presync  map[string]*presyncState
+	retained map[*Entry]struct{}
+	subs     map[chan Event]struct{}
+	hooks    []func(Event)
 	// delivered names the peer each stored block not yet validated came
 	// from; offenders are peers whose blocks then failed (wiki: node/sync).
 	delivered map[hashing.Hash]string
@@ -224,6 +235,12 @@ type Chain struct {
 	// loading indexes stored blocks whatever the operator's marks, which
 	// Load then applies.
 	loading bool
+	// runs holds the blocks peers pushed that are not stored yet, a run for
+	// each connection (pushed.go); runBytes is their size in all.
+	runs     map[string]*heldRun
+	runBytes int
+	// walks keeps, for each peer, the walk its pre-sync last began with.
+	walks map[string]*keptWalk
 }
 
 // NoSeed, passed as a seed list, makes a private chain with no seed heights
@@ -281,7 +298,8 @@ func New(g *types.GenesisConfig, seed []hashing.Hash, store BlockStore, cfg Conf
 		bestPath:   []*Entry{gen},
 		frontier:   1,
 		inFlight:   map[hashing.Hash]flight{},
-		expired:    map[hashing.Hash]flight{},
+		barred:     map[bar]time.Time{},
+		released:   make(chan struct{}),
 		presync:    map[string]*presyncState{},
 		delivered:  map[hashing.Hash]string{},
 		failedWork: new(big.Int),
@@ -289,6 +307,8 @@ func New(g *types.GenesisConfig, seed []hashing.Hash, store BlockStore, cfg Conf
 		retained:   map[*Entry]struct{}{gen: {}},
 		subs:       map[chan Event]struct{}{},
 		lost:       map[hashing.Hash]*Entry{},
+		runs:       map[string]*heldRun{},
+		walks:      map[string]*keptWalk{},
 	}
 	if err := c.loadMarks(); err != nil {
 		return nil, err
@@ -368,6 +388,24 @@ func (c *Chain) Get(id hashing.Hash) (*Entry, bool) {
 	defer c.mu.RUnlock()
 	e, ok := c.entries[id]
 	return e, ok
+}
+
+// StateOf returns the state after a block if it is kept in memory, without
+// waiting for block processing as StateAt does.
+func (c *Chain) StateOf(e *Entry) (state.Tree, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if e.state == nil {
+		return state.Tree{}, false
+	}
+	return *e.state, true
+}
+
+// StatusOf returns an entry's status as it is now.
+func (c *Chain) StatusOf(e *Entry) Status {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return e.Status
 }
 
 // AtHeight returns the canonical entry at a height.
@@ -482,14 +520,65 @@ func (c *Chain) AcceptHeader(h *types.Header) error {
 	if _, ok := c.Get(id); ok {
 		return nil
 	}
-	_, err := c.acceptHeader(h, id, false, false)
+	_, err := c.acceptHeader(h, id, admitBlock)
 	return err
 }
 
-// acceptHeader indexes a header. recovered skips the clock and threshold
-// checks for blocks this node stored before; noThreshold skips the threshold
-// only, for a pre-synced chain. Called with processMu held.
-func (c *Chain) acceptHeader(h *types.Header, id hashing.Hash, recovered, noThreshold bool) (*Entry, error) {
+// admission is the policy a header not yet indexed is held to, beyond the
+// rules.
+type admission int
+
+const (
+	// admitBlock: a block this node stores, its own or one it takes whole.
+	// Its chain must lie within a day's work of the tip.
+	admitBlock admission = iota
+	// admitSynced: a header a peer shows. It is kept only when its chain
+	// overtakes the best header by the fork-choice margin of its own block,
+	// as a chain extending the best header does. Every child of one block
+	// has the same target, so each sibling costs its sender one block of
+	// work and a margin below the best header would bound nothing: kept,
+	// siblings would fill the index for as long as a peer cares to mine
+	// them. Any other header is checked by a pre-sync, which keeps none.
+	admitSynced
+	// admitPresynced: a header of a chain a pre-sync checked to its end.
+	admitPresynced
+	// admitRecovered: a block this node stored before; no policy applies.
+	admitRecovered
+)
+
+// acceptHeader checks a header and indexes it. Called with processMu held.
+func (c *Chain) acceptHeader(h *types.Header, id hashing.Hash, policy admission) (*Entry, error) {
+	e, err := c.checkedHeader(h, id, policy)
+	if err != nil {
+		return nil, err
+	}
+	return c.indexHeader(e), nil
+}
+
+// indexHeader adds a checked header to the index, where it may become the
+// best header; it returns the entry the index holds. Called with processMu
+// held.
+func (c *Chain) indexHeader(e *Entry) *Entry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if old, ok := c.entries[e.ID]; ok {
+		return old
+	}
+	c.entries[e.ID] = e
+	e.Parent.children = append(e.Parent.children, e)
+	if better(e, c.best) {
+		c.setBest(e)
+	}
+	return e
+}
+
+// checkedHeader applies the header rules and the policy to a header and
+// returns its entry without indexing it (or the entry the index holds). A
+// block's header is indexed only once its body has matched it: a header
+// alone moves the best header, and with it what the node downloads and
+// whether its miner waits. Called with processMu held.
+func (c *Chain) checkedHeader(h *types.Header, id hashing.Hash, policy admission) (*Entry, error) {
+	recovered := policy == admitRecovered
 	c.mu.RLock()
 	reason, bad := c.invalid[id]
 	_, marked := c.marks[id]
@@ -534,24 +623,33 @@ func (c *Chain) acceptHeader(h *types.Header, id hashing.Hash, recovered, noThre
 	}
 	work := consensus.Work(h.Target)
 	chainWork := new(big.Int).Add(parent.ChainWork, work)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !recovered && !noThreshold && chainWork.Cmp(c.threshold()) < 0 {
-		return nil, ErrBehind
-	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if e, ok := c.entries[id]; ok {
 		return e, nil
 	}
-	e := &Entry{
+	switch policy {
+	case admitBlock:
+		if chainWork.Cmp(c.threshold()) < 0 {
+			return nil, ErrBehind
+		}
+	case admitSynced:
+		if !exceeds(chainWork, work, c.best.ChainWork) {
+			return nil, ErrBehind
+		}
+	}
+	return &Entry{
 		ID: id, Header: h, Parent: parent, Height: h.Height, Timestamp: h.Timestamp, Target: h.Target,
 		Votes: h.Votes, BlockWork: work, ChainWork: chainWork, Vote: vs, Status: StatusHeader,
-	}
-	c.entries[id] = e
-	parent.children = append(parent.children, e)
-	if better(e, c.best) {
-		c.setBest(e)
-	}
-	return e, nil
+	}, nil
+}
+
+// exceeds is the fork-choice margin: whether a chain's work is more than
+// base by over half the work of its last block.
+func exceeds(chainWork, blockWork, base *big.Int) bool {
+	margin := new(big.Int).Rsh(blockWork, 1)
+	margin.Add(margin, base)
+	return chainWork.Cmp(margin) > 0
 }
 
 // fail classifies a header rule failure: a listed seed block is the node's
@@ -651,6 +749,11 @@ func (c *Chain) ProcessBlockFrom(raw []byte, peer string) (*Entry, error) {
 	if c.broken != nil {
 		return nil, c.broken
 	}
+	return c.process(raw, peer)
+}
+
+// process stores a block and moves the tip. Called with processMu held.
+func (c *Chain) process(raw []byte, peer string) (*Entry, error) {
 	e, known, err := c.acceptBlock(raw, false)
 	if err != nil {
 		return e, err
@@ -662,6 +765,12 @@ func (c *Chain) ProcessBlockFrom(raw []byte, peer string) (*Entry, error) {
 		}
 		c.mu.Unlock()
 	}
+	return c.settle(e, known)
+}
+
+// settle moves the tip after e was stored and says what became of e. Called
+// with processMu held.
+func (c *Chain) settle(e *Entry, known bool) (*Entry, error) {
 	c.lastErr = nil
 	if err := c.activate(); err != nil {
 		return e, err
@@ -715,23 +824,21 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 			return nil, false, ErrAhead
 		}
 	default:
+		// Checked now, indexed below once the body has matched it.
+		policy := admitBlock
+		if recovered {
+			policy = admitRecovered
+		}
 		var err error
-		if e, err = c.acceptHeader(h, id, recovered, false); err != nil {
+		if e, err = c.checkedHeader(h, id, policy); err != nil {
 			return nil, false, err
 		}
 	}
-	if uint64(len(raw)) > e.Vote.Limits[types.D] {
-		return e, false, mismatch(h, id, "block of %d bytes exceeds D capacity %d", len(raw), e.Vote.Limits[types.D])
-	}
-	body, err := types.DecodeBody(raw[types.HeaderSize:])
+	body, err := checkBody(h, id, raw, e.Vote.Limits[types.D])
 	if err != nil {
-		return e, false, mismatch(h, id, "%v", err)
+		return e, false, err
 	}
-	if types.ProducerHash(body.ProducerData) != h.ProducerHash ||
-		commit.TransactionsRoot(body.Transactions) != h.TransactionsRoot ||
-		commit.ReceiptsRoot(body.Receipts) != h.ReceiptsRoot {
-		return e, false, mismatch(h, id, "body commitment mismatch")
-	}
+	e = c.indexHeader(e)
 	if err := c.store.Put(id, raw); err != nil {
 		return e, false, fmt.Errorf("storing block: %w", err)
 	}
@@ -747,6 +854,25 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 	c.advanceFrontier()
 	c.mu.Unlock()
 	return e, false, nil
+}
+
+// checkBody checks a block's bytes against its header, as far as storing or
+// holding it needs: within the data capacity that bounds it, a body that
+// decodes, and the three roots the header commits to.
+func checkBody(h *types.Header, id hashing.Hash, raw []byte, limit uint64) (*types.Body, error) {
+	if uint64(len(raw)) > limit {
+		return nil, mismatch(h, id, "block of %d bytes exceeds D capacity %d", len(raw), limit)
+	}
+	body, err := types.DecodeBody(raw[types.HeaderSize:])
+	if err != nil {
+		return nil, mismatch(h, id, "%v", err)
+	}
+	if types.ProducerHash(body.ProducerData) != h.ProducerHash ||
+		commit.TransactionsRoot(body.Transactions) != h.TransactionsRoot ||
+		commit.ReceiptsRoot(body.Receipts) != h.ReceiptsRoot {
+		return nil, mismatch(h, id, "body commitment mismatch")
+	}
+	return body, nil
 }
 
 // markComplete records that e has data; it and every descendant with data
@@ -789,6 +915,7 @@ func (c *Chain) markInvalid(e *Entry, err error) []*Entry {
 		marked = append(marked, n)
 		n.complete = false
 		n.state = nil
+		n.changes = nil
 		delete(c.retained, n)
 		delete(c.heads, n)
 		delete(c.inFlight, n.ID)
@@ -929,7 +1056,7 @@ func (c *Chain) activate() error {
 		if head == nil || head == tip {
 			return c.maybeFlush()
 		}
-		valid, err := c.connect(head)
+		reached, err := c.connect(head)
 		if errors.Is(err, errReplaying) || errors.Is(err, errBodyLost) {
 			waiting[head] = true
 			continue
@@ -937,26 +1064,54 @@ func (c *Chain) activate() error {
 		if err != nil {
 			return err
 		}
-		if valid {
-			c.publish(c.setTip(head))
+		if reached != nil {
+			c.publish(c.setTip(reached))
+			if reached != head {
+				// A long branch connects a stretch at a time, the base
+				// following, so that memory holds a stretch of states and
+				// change lists, not the branch's.
+				if err := c.maybeFlush(); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }
 
+// connectStretch is how many blocks that extend the tip connect before the
+// tip moves to them and the base may follow.
+const connectStretch = 256
+
 // connect executes the blocks between the executed part of the tree and
-// head. It reports whether head is valid; on a failure it marks the failing
-// block invalid and returns false.
-func (c *Chain) connect(head *Entry) (bool, error) {
+// head. It returns the block the tip may move to: head, or, on a long
+// branch that extends the tip, the end of its first stretch; nil when a
+// block failed, which it marks invalid, or when the branch must wait.
+func (c *Chain) connect(head *Entry) (*Entry, error) {
+	reached, valid, err := c.connectBranch(head)
+	if err != nil || !valid {
+		return nil, err
+	}
+	return reached, nil
+}
+
+func (c *Chain) connectBranch(head *Entry) (*Entry, bool, error) {
 	c.mu.RLock()
 	var branch []*Entry
 	for n := head; n.Status != StatusValid; n = n.Parent {
 		branch = append(branch, n)
 	}
+	tip := c.tip
 	c.mu.RUnlock()
 	if len(branch) == 0 {
-		return true, nil
+		return head, true, nil
 	}
 	fork := branch[len(branch)-1].Parent
+	// A branch that leaves the tip behind connects whole or not at all: no
+	// block of it is the tip until all of it has passed.
+	if fork == tip && len(branch) > connectStretch {
+		branch = branch[len(branch)-connectStretch:]
+		head = branch[0]
+	}
 	st, err := c.stateAt(fork)
 	if errors.Is(err, ErrBelowBase) {
 		// The branch forks below the database's base: rewind it first.
@@ -965,15 +1120,15 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 		c.mu.RUnlock()
 		waiting, rerr := c.rewindTo(to)
 		if rerr != nil {
-			return false, c.storageFail(rerr)
+			return nil, false, c.storageFail(rerr)
 		}
 		if waiting {
-			return false, errReplaying
+			return nil, false, errReplaying
 		}
 		st, err = c.stateAt(fork)
 	}
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	for i := len(branch) - 1; i >= 0; i-- {
 		b := branch[i]
@@ -981,16 +1136,36 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 		if err != nil {
 			// The block is fetched again; the branch waits for it.
 			c.forgetBody(b, err)
-			return false, nil
+			return nil, false, nil
 		}
 		res, err := c.executeBody(st, b.Header, b.ID, raw, body, b.Vote.Limits)
 		if err != nil {
 			if !errors.Is(err, ErrInvalid) {
-				return false, err
+				// The state the block ran on could not be read, or does
+				// not hold together: the node's own fault, never the
+				// block's, and nothing to go on with.
+				if c.cfg.State != nil {
+					return nil, false, c.storageFail(err)
+				}
+				return nil, false, err
+			}
+			if c.cfg.State != nil {
+				// Before the block is marked invalid for good, with every
+				// block above it, and its sender banned: the same block on
+				// the same state, every record read by its path in the
+				// stored tree and checked against it. A block that passes
+				// then failed on a damaged record table.
+				if _, again := c.executeBody(st.Checked(), b.Header, b.ID, raw, body, b.Vote.Limits); !errors.Is(again, ErrInvalid) {
+					if again == nil {
+						again = errors.New("the stored records differ from the state tree")
+					}
+					return nil, false, c.storageFail(fmt.Errorf("block %s at height %d fails on the stored records only: %w",
+						b.ID, b.Height, again))
+				}
 			}
 			if c.listedAs(b.Header, b.ID) {
 				// The seed's blocks are canonical: the fault is this node's.
-				return false, &SeedConformanceError{Height: b.Height, ID: b.ID, Err: err}
+				return nil, false, &SeedConformanceError{Height: b.Height, ID: b.ID, Err: err}
 			}
 			c.mu.Lock()
 			// Whoever delivered a block the failure invalidates sent
@@ -1004,7 +1179,7 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 			}
 			c.mu.Unlock()
 			c.lastErr, c.lastErrID = err, b.ID
-			return false, nil
+			return nil, false, nil
 		}
 		st = res.State
 		s := st
@@ -1018,7 +1193,7 @@ func (c *Chain) connect(head *Entry) (bool, error) {
 		delete(c.delivered, b.ID)
 		c.mu.Unlock()
 	}
-	return true, nil
+	return head, true, nil
 }
 
 // setTip makes e the canonical head and returns the event.
@@ -1235,7 +1410,8 @@ func (c *Chain) Load() (int, error) {
 // processMu held.
 func (c *Chain) indexStored() (int, error) {
 	n := 0
-	var waiting [][]byte
+	// Ids, not bytes: the blocks stay in their files until their turn.
+	var waiting []hashing.Hash
 	err := c.store.Each(func(id hashing.Hash, raw []byte) error {
 		c.mu.RLock()
 		e, indexed := c.entries[id]
@@ -1249,7 +1425,7 @@ func (c *Chain) indexStored() (int, error) {
 		case err == nil:
 			n++
 		case errors.Is(err, ErrUnknownParent):
-			waiting = append(waiting, raw)
+			waiting = append(waiting, id)
 		default:
 			// Invalid, marked, or no longer acceptable: not part of any
 			// branch. A block that is needed is fetched again.
@@ -1261,15 +1437,19 @@ func (c *Chain) indexStored() (int, error) {
 	}
 	for progress := true; progress && len(waiting) > 0; {
 		progress = false
-		var left [][]byte
-		for _, raw := range waiting {
-			_, _, err := c.acceptBlock(raw, true)
+		var left []hashing.Hash
+		for _, id := range waiting {
+			raw, err := c.store.Get(id)
+			if err != nil {
+				continue // fetched again if it is needed
+			}
+			_, _, err = c.acceptBlock(raw, true)
 			switch {
 			case err == nil:
 				n++
 				progress = true
 			case errors.Is(err, ErrUnknownParent):
-				left = append(left, raw)
+				left = append(left, id)
 			}
 		}
 		waiting = left
@@ -1380,9 +1560,18 @@ func (c *Chain) ValidateNext(parent *Entry, raw []byte) error {
 // indexing it: whether the block is stored already, and otherwise the data
 // capacity that bounds the block's size.
 func (c *Chain) CheckHeader(h *types.Header) (known bool, max uint64, err error) {
+	return c.CheckHeaderFrom(h, "")
+}
+
+// CheckHeaderFrom is CheckHeader for a block peer pushes: its parent may be
+// a block of the run held for that connection.
+func (c *Chain) CheckHeaderFrom(h *types.Header, peer string) (known bool, max uint64, err error) {
 	c.processMu.Lock()
 	defer c.processMu.Unlock()
 	id := h.ID()
+	if known, max, ok, err := c.checkHeld(h, id, peer); ok {
+		return known, max, err
+	}
 	c.mu.RLock()
 	e, ok := c.entries[id]
 	marked := c.byOperator(id) || (!ok && c.byOperatorParent(h.ParentID))

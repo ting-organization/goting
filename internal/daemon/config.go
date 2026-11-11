@@ -32,7 +32,10 @@ type Config struct {
 	Peers      []netip.AddrPort `json:"peers"`
 	Discovery  bool             `json:"discovery"`
 	MaxPeers   uint32           `json:"max_peers"`
-	Votes      [4]uint8         `json:"votes"`
+	// MaxInbound is the most inbound peer connections at once, read at
+	// start; a seed node's operator may raise it.
+	MaxInbound uint32   `json:"max_inbound"`
+	Votes      [4]uint8 `json:"votes"`
 	// The built-in CPU miner: whether it runs from start, with how many
 	// threads, and the least seconds between its own blocks.
 	MinerEnabled bool    `json:"miner_enabled"`
@@ -46,6 +49,9 @@ type Config struct {
 	MempoolMiB          uint64 `json:"mempool_mib"`
 }
 
+// InboundLimit is the most max_inbound may say.
+const InboundLimit = 1024
+
 // ProducerMax bounds producer_hex.
 const ProducerMax = 4096
 
@@ -54,16 +60,16 @@ func DefaultConfig() Config {
 	return Config{Version: 1, Name: "Ting node",
 		Control: netip.MustParseAddrPort("127.0.0.1:18440"), P2P: netip.MustParseAddrPort("127.0.0.1:18442"),
 		API: netip.MustParseAddrPort("127.0.0.1:18441"), Peers: []netip.AddrPort{}, Discovery: true,
-		MaxPeers: 8, MinerThreads: 1, UndoWindow: 43_200, DBCacheMiB: 256,
+		MaxPeers: 8, MaxInbound: 125, MinerThreads: 1, UndoWindow: 43_200, DBCacheMiB: 256,
 		MempoolTransactions: 1024, MempoolMiB: 16}
 }
 
 // Validate applies the reference's bounds.
 func (c *Config) Validate() error {
 	if c.Version != 1 || !c.Control.Addr().Unmap().IsLoopback() || len(c.Name) > 128 || len(c.Peers) > 32 ||
-		c.MaxPeers < 1 || c.MaxPeers > 64 || c.Votes[0] > 2 || c.Votes[1] > 2 || c.Votes[2] > 2 || c.Votes[3] > 2 ||
+		c.MaxPeers < 1 || c.MaxPeers > 64 || c.MaxInbound < 1 || c.MaxInbound > InboundLimit || c.Votes[0] > 2 || c.Votes[1] > 2 || c.Votes[2] > 2 || c.Votes[3] > 2 ||
 		c.MinerThreads < 1 || c.MinerThreads > 64 || c.DBCacheMiB == 0 || c.MempoolTransactions == 0 || c.MempoolMiB == 0 {
-		return errors.New("invalid configuration (control must be loopback, maximum 32 peers, max_peers 1..64, " +
+		return errors.New("invalid configuration (control must be loopback, maximum 32 peers, max_peers 1..64, max_inbound 1..1024, " +
 			"votes 0..2, miner threads 1..64, db_cache_mib, mempool_transactions and mempool_mib at least 1)")
 	}
 	if c.ProducerHex != nil {

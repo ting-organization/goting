@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"net/netip"
@@ -326,6 +327,26 @@ func (m *Addresses) put(e *enc) {
 type ErrorAnswer struct{ Text string }
 
 func (e *ErrorAnswer) Error() string { return "peer: " + e.Text }
+
+// Error texts a node acts on. The protocol gives an error no code, so a
+// node knows these by their wording, which is the reference node's: change
+// one and two versions stop understanding each other. Every text the peer
+// code compares an answer with is here, and wire_test.go holds them to the
+// wording.
+const (
+	TextBlockNotFound    = "block not found"
+	TextNoCommonAncestor = "no common ancestor"
+	TextPoolFull         = "mempool is full"
+	TextDeferredFull     = "deferred set is full"
+)
+
+// NoRoom reports whether err is a peer's answer that it had no room for a
+// transaction, which a block may make: the transaction is offered again
+// once the tip has moved. Any other refusal is final for the connection.
+func NoRoom(err error) bool {
+	var ea *ErrorAnswer
+	return errors.As(err, &ea) && (ea.Text == TextPoolFull || ea.Text == TextDeferredFull)
+}
 
 // EncodeError returns an error answer's payload, cut at a character
 // boundary to 1,024 bytes.

@@ -111,9 +111,14 @@ func readFrame(c net.Conn, max int, deadline time.Duration) (map[string]any, err
 	if n == 0 || n > max {
 		return nil, errors.New("frame size limit")
 	}
-	b := make([]byte, n)
-	if _, err := io.ReadFull(c, b); err != nil {
+	// Read as it arrives: a length alone, sent before the caller has
+	// proved anything, reserves nothing.
+	b, err := io.ReadAll(io.LimitReader(c, int64(n)))
+	if err != nil {
 		return nil, err
+	}
+	if len(b) != n {
+		return nil, io.ErrUnexpectedEOF
 	}
 	structure := 0
 	for _, x := range b {

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -42,8 +43,11 @@ const (
 	pageMax   = 100
 	pageSize  = 20
 	batchMax  = 1024
+	// storageBodyMax bounds a batch storage read's body: 256 bytes for each
+	// record it may name (one is 153 in compact JSON) and 4 KiB for the rest.
+	storageBodyMax = 256*batchMax + 4096
 	// Version is this node's version in its status.
-	Version = "0.3.0"
+	Version = "0.4.0"
 )
 
 // APIOptions configures the REST API.
@@ -100,7 +104,6 @@ func (n *Node) API(opts APIOptions) http.Handler {
 		}
 		select {
 		case slots <- struct{}{}:
-			defer func() { <-slots }()
 		default:
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "HTTP service busy"})
 			return
@@ -111,21 +114,44 @@ func (n *Node) API(opts APIOptions) http.Handler {
 		if r.Method == http.MethodPost {
 			deadline += chain.TransferTime(n.submissionLimit()) - chain.TransferTime(0)
 		}
+		// The connection's own timers: a body that stops arriving and an
+		// answer nobody reads end with the request, not with the client.
+		rc := http.NewResponseController(w)
+		rc.SetReadDeadline(time.Now().Add(deadline + 5*time.Second))
+		rc.SetWriteDeadline(time.Now().Add(deadline + chain.TransferTime(0)))
 		ctx, cancel := context.WithTimeout(r.Context(), deadline)
 		defer cancel()
 		tw := &timeoutWriter{w: w, h: make(http.Header)}
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
+			// This goroutine is not the server's: a panic here would end the
+			// whole node, not the request.
+			defer func() {
+				if v := recover(); v != nil {
+					n.panicked("REST "+r.URL.Path, v, debug.Stack())
+					tw.fail()
+				}
+			}()
 			r.Body = http.MaxBytesReader(tw, r.Body, frameMax)
 			mux.ServeHTTP(tw, r.WithContext(ctx))
 		}()
 		select {
 		case <-done:
+			// The slot is held until the answer is written, so the slots
+			// also bound the answers held for slow clients.
+			rc.SetWriteDeadline(time.Now().Add(chain.TransferTime(uint64(tw.buf.Len()))))
 			tw.flush()
+			<-slots
 		case <-ctx.Done():
 			tw.abandon()
 			writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "HTTP deadline exceeded"})
+			// The work goes on until it notices; its slot stays taken until
+			// then, so requests past their deadline cannot pile up.
+			go func() {
+				<-done
+				<-slots
+			}()
 		}
 	})
 }
@@ -167,6 +193,16 @@ func (t *timeoutWriter) Write(b []byte) (int, error) {
 		t.code = http.StatusOK
 	}
 	return t.buf.Write(b)
+}
+
+// fail replaces whatever the handler wrote with an internal error.
+func (t *timeoutWriter) fail() {
+	t.mu.lock()
+	defer t.mu.unlock()
+	t.h = http.Header{"Content-Type": {"application/json"}}
+	t.code = http.StatusInternalServerError
+	t.buf.Reset()
+	t.buf.WriteString("{\"error\":\"internal error\"}\n")
 }
 func (t *timeoutWriter) abandon() {
 	t.mu.lock()
@@ -367,11 +403,15 @@ func (n *Node) blockJSON(e *chain.Entry) (map[string]any, error) {
 		}
 		receipts[i] = receiptJSON(r)
 	}
+	// What the node knows of the block: valid, stored or invalid. One only
+	// stored, or one that failed, is still served, and its receipts must
+	// not pass for checked.
+	status := n.Chain.StatusOf(e)
 	var limits any
-	if e.Status == chain.StatusValid {
+	if status == chain.StatusValid {
 		limits = e.Vote.Limits
 	}
-	return map[string]any{"id": e.ID, "height": h.Height, "parent": h.ParentID, "timestamp": h.Timestamp,
+	return map[string]any{"id": e.ID, "status": status.String(), "height": h.Height, "parent": h.ParentID, "timestamp": h.Timestamp,
 		"target": targetHex(h.Target), "work": e.ChainWork.String(), "canonical": n.Chain.IsCanonical(e),
 		"state_root": h.StateRoot, "transactions_root": h.TransactionsRoot, "receipts_root": h.ReceiptsRoot,
 		"used": h.ResourcesUsed, "limits": limits, "votes": h.Votes, "producer_hex": hexOf(body.ProducerData),
@@ -451,6 +491,7 @@ func (n *Node) Status() map[string]any {
 			undoPruned = floor
 		}
 	}
+	_, heldBlocks, heldBytes := c.Held()
 	return map[string]any{"name": n.cfg.Name, "version": Version, "network": n.network(),
 		"chain_id": c.ChainID(), "genesis": c.GenesisID(), "height": tip.Height, "tip": tip.ID,
 		"work": tip.ChainWork.String(), "state_root": root, "limits": n.nextLimits(),
@@ -458,7 +499,8 @@ func (n *Node) Status() map[string]any {
 		"deferred_count": n.DeferredLen(), "producer_hex": hexOf(n.Producer()),
 		"stored_blocks": stored, "best_height": best, "state_records": records,
 		"uptime_seconds": uint64(time.Since(n.started).Seconds()), "undo_pruned": undoPruned, "settled_height": settled,
-		"held_headers": headers, "replaying": c.Replaying(), "marked": marked, "reorganization": reorg,
+		"held_headers": headers, "held_pushed_blocks": heldBlocks, "held_pushed_bytes": heldBytes,
+		"replaying": c.Replaying(), "marked": marked, "reorganization": reorg,
 		"warnings": warnings}
 }
 
@@ -981,6 +1023,11 @@ func (n *Node) apiEvents(w http.ResponseWriter, r *http.Request) {
 // tipView is the tip's state, which reads in one answer come from.
 func (n *Node) tipView() (*chain.Entry, state.Tree, error) {
 	tip := n.Chain.Tip()
+	// The tip's state is kept: a read need not queue behind the block
+	// being processed.
+	if st, ok := n.Chain.StateOf(tip); ok {
+		return tip, st, nil
+	}
 	st, err := n.Chain.StateAt(tip)
 	if err != nil {
 		return nil, state.Tree{}, fmt.Errorf("storage: %v", err)
@@ -1084,8 +1131,10 @@ const tooLarge = "JSON response size limit; ask for fewer entries or records, or
 // apiStorageBatch reads 1 to 1,024 records from one state, so records read
 // together never straddle a block.
 func (n *Node) apiStorageBatch(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
+	// Bounded before it is parsed: a body of the general limit names some
+	// 671,000 empty reads, which cost hundreds of MiB to decode.
+	body, err := io.ReadAll(io.LimitReader(r.Body, storageBodyMax+1))
+	if err != nil || len(body) > storageBodyMax {
 		respond(w, nil, &apiError{http.StatusRequestEntityTooLarge, "request body too large"})
 		return
 	}

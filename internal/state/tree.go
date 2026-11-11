@@ -50,6 +50,50 @@ type Tree struct {
 	root  *node
 	count int
 	src   Source // where stubs load from; nil for a tree wholly in memory
+	// checked reads every stored record by its path in the tree (Checked).
+	checked bool
+}
+
+// Checked returns the same tree reading every stored record by its path
+// down the stored branches, each checked against its parent's hash, and the
+// value against its leaf's: slower than the record table, and proof against
+// a damaged one. A node uses it to tell a block that is invalid from a
+// record table that is.
+func (t Tree) Checked() Tree {
+	t.checked = true
+	return t
+}
+
+// getChecked is Get by the stored tree alone.
+func (t Tree) getChecked(k Key) ([]byte, bool) {
+	n := t.root
+	for n != nil {
+		if n.leaf {
+			if n.key != k {
+				return nil, false
+			}
+			if !n.stub {
+				return n.value, true
+			}
+			v, ok := t.src.Record(k)
+			if !ok || leafHash(&k, v) != n.hash {
+				panic(&StorageError{Err: errLeafRecord})
+			}
+			return v, true
+		}
+		if n.stub {
+			if firstDiff(&n.key, &k) < int(n.split) {
+				return nil, false
+			}
+			n = expand(t.src, n, 0)
+		}
+		if bit(&k, int(n.split)) == 0 {
+			n = n.left
+		} else {
+			n = n.right
+		}
+	}
+	return nil, false
 }
 
 // Empty is the tree with no records.
@@ -79,6 +123,9 @@ func firstDiff(a, b *Key) int {
 // Get returns the record's value and whether it is present. Below a stub,
 // the record comes from the source's record table.
 func (t Tree) Get(k Key) ([]byte, bool) {
+	if t.checked {
+		return t.getChecked(k)
+	}
 	n := t.root
 	for n != nil {
 		if n.leaf {

@@ -376,10 +376,18 @@ func decodeTail(t []byte, e *EventRow) {
 // Occurrences lists a transaction's indexed occurrences, lowest height
 // first, whatever branch their blocks are on.
 func (d *DB) Occurrences(tx hashing.Hash) ([]Occurrence, error) {
+	return d.OccurrencesFrom(tx, 0)
+}
+
+// OccurrencesFrom lists a transaction's indexed occurrences at height from
+// and above, lowest first: a transaction may be included again in every
+// block, so a check of the recent blocks must not read them all.
+func (d *DB) OccurrencesFrom(tx hashing.Hash, from uint64) ([]Occurrence, error) {
 	var out []Occurrence
+	start := binary.BigEndian.AppendUint64(append([]byte(nil), tx[:]...), from)
 	err := d.bolt.View(func(btx *bolt.Tx) error {
 		c := btx.Bucket(bucketOccur).Cursor()
-		for k, v := c.Seek(tx[:]); k != nil && string(k[:32]) == string(tx[:]); k, v = c.Next() {
+		for k, v := c.Seek(start); k != nil && string(k[:32]) == string(tx[:]); k, v = c.Next() {
 			if len(k) != 76 || len(v) != 1 {
 				return errors.New("bad occurrence row")
 			}
