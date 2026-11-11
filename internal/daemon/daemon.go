@@ -75,7 +75,10 @@ type Daemon struct {
 
 	api     *http.Server
 	apiCORS bool
-	stop    context.CancelFunc
+	// restConns is the most REST connections at once: what the open-file
+	// limit leaves beside peers and storage.
+	restConns int
+	stop      context.CancelFunc
 }
 
 // Run runs the node of a data directory until it is told to stop, through
@@ -160,6 +163,9 @@ func Run(dir string, log *slog.Logger) error {
 	base := c.Base()
 	log.Info("chain loaded", "blocks", loaded, "height", c.Tip().Height, "state_base", base.Height,
 		"elapsed", time.Since(start))
+	// A log or status pipe that closes must not end the node: Go ends a
+	// process that writes to a closed standard output.
+	signal.Ignore(syscall.SIGPIPE)
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
@@ -172,6 +178,7 @@ func Run(dir string, log *slog.Logger) error {
 	}()
 
 	d := &Daemon{dir: dir, log: log, token: token, cfg: cfg, chain: c, stop: stop}
+	d.restConns = restConnections(cfg, log)
 	n := node.New(c, node.Config{Name: cfg.Name, Mine: cfg.MinerEnabled, Producer: cfg.Producer(), Votes: cfg.Votes,
 		Workers: int(cfg.MinerThreads), Interval: time.Duration(cfg.MinerSpacing) * time.Second,
 		PoolTransactions: cfg.MempoolTransactions, PoolMiB: int(cfg.MempoolMiB),
@@ -188,7 +195,7 @@ func Run(dir string, log *slog.Logger) error {
 		connect[i] = a.String()
 	}
 	d.peers = node.NewPeers(n, node.PeerConfig{Listen: cfg.P2P.String(), Connect: connect, Seeds: seeds,
-		Discovery: cfg.Discovery, MaxPeers: int(cfg.MaxPeers), Agent: Agent,
+		Discovery: cfg.Discovery, MaxPeers: int(cfg.MaxPeers), MaxInbound: int(cfg.MaxInbound), Agent: Agent,
 		BookPath: filepath.Join(dir, "peers.json")})
 
 	var wg sync.WaitGroup
@@ -248,6 +255,29 @@ func Run(dir string, log *slog.Logger) error {
 	return fatal
 }
 
+// restConnections is how many connections REST may hold: the reference's
+// 512, or what the open-file limit leaves once the peer connections
+// (max_inbound, max_peers, 32 configured peers) and 64 files for storage and
+// the node's own use have theirs. REST is the one listener anyone can fill,
+// so it must never take the files the others need.
+func restConnections(cfg *Config, log *slog.Logger) int {
+	limit, ok := openFileLimit()
+	if !ok {
+		return node.RESTConnections
+	}
+	reserved := uint64(cfg.MaxInbound) + uint64(cfg.MaxPeers) + node.MaxConfigured + 64
+	left := uint64(16)
+	if limit > reserved+left {
+		left = limit - reserved
+	}
+	if left >= node.RESTConnections {
+		return node.RESTConnections
+	}
+	log.Warn("the open-file limit is low: REST takes fewer connections than it would", "limit", limit,
+		"rest_connections", left, "wanted", node.RESTConnections)
+	return int(left)
+}
+
 func addrOf(ln net.Listener) netip.AddrPort {
 	ap, _ := netip.ParseAddrPort(ln.Addr().String())
 	return ap
@@ -285,8 +315,8 @@ func (d *Daemon) setAPI(enabled, cors, persist bool) (any, error) {
 			}
 			d.cfg = &c
 		}
-		srv := &http.Server{Handler: d.node.API(node.APIOptions{CORS: cors}), ReadHeaderTimeout: 10 * time.Second}
-		go srv.Serve(ln)
+		srv := node.NewAPIServer(d.node.API(node.APIOptions{CORS: cors}))
+		go srv.Serve(node.LimitListener(ln, d.restConns))
 		d.api, d.apiCORS = srv, cors
 		a := addrOf(ln)
 		d.running.API = &a

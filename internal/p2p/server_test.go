@@ -35,7 +35,7 @@ func (f *fakeBackend) Block(id hashing.Hash) ([]byte, error) {
 	}
 	return nil, ErrNotFound
 }
-func (f *fakeBackend) CheckHeader(h []byte) (bool, hashing.Hash, uint64, error) {
+func (f *fakeBackend) CheckHeader(h []byte, _ netip.AddrPort) (bool, hashing.Hash, uint64, error) {
 	if h[0] == 0xbb {
 		return false, hashing.Hash{}, 0, &InvalidData{Text: "invalid block: test"}
 	}

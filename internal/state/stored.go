@@ -28,7 +28,7 @@ func (e *StorageError) Unwrap() error { return e.Err }
 
 var (
 	errBranchHash = errors.New("stored branch does not match its hash")
-	errLeafRecord = errors.New("stored leaf without its record")
+	errLeafRecord = errors.New("stored leaf without its record, or with another value")
 )
 
 // Recover, deferred, turns a storage failure raised below into *err.

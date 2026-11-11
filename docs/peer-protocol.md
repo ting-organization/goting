@@ -16,8 +16,12 @@ reference node does with it.
 | 18441 | The REST API over HTTP, when the node's operator turns it on; its reference is served at `/docs` |
 | 18440 | The control channel, on the node's own machine only, never for peers ([security](../node/security.md#the-control-channel)) |
 
-The production network's seed node is `2.29.97.212:18442`. A node learns of the
-others through the [`addresses`](#requests) request.
+The production network's seed nodes are `node1.ting-node.com:18442` and
+`node2.ting-node.com:18442`. A node learns of the others through the
+[`addresses`](#requests) request. A reference node asks for them first on every
+new connection, and leaves the seeds once it has caught up and enough other peers
+can serve it, so that the seeds keep room for new nodes
+([finding more peers](../node/sync.md#finding-more-peers)).
 
 ## A connection
 
@@ -119,10 +123,14 @@ length has, and every answer 30 seconds from its request.
   unless its operator marked it or a block below it invalid. Any other block, stored
   or not, is answered with `block not found`.
 - **`inventory`.** Up to 1,024 ids of pooled transactions, deferred ones left out,
-  or with the flag of deferred ones, in id order after `after`.
+  or with the flag of deferred ones, in id order after `after`. When more follow,
+  `next` is the last id listed.
 - **`submit`.** Refused with `transaction already included` when one of the node's
   last 1,440 canonical blocks included the transaction and it succeeded there, or
   one of the last 10 included it at all.
+- **`addresses`.** The reference node gives every peer the same answer for an hour:
+  asking again within it is answered with the same list, never with an error
+  ([what a node shares](../node/sync.md#finding-more-peers)).
 
 ## Answers
 
@@ -132,16 +140,16 @@ length has, and every answer 30 seconds from its request.
 | 1 | Headers | A list of at most 2,000 headers |
 | 2 | Slice | `offset` `u64`, `total` `u64`, the item's full length, and bytes of at most 1 MiB |
 | 3 | Received | `u64`: the bytes of a push taken so far |
-| 4 | Taken | `id` of the block or transaction, and `known` flag: the node held it already |
-| 5 | Inventory | A list of at most 1,024 ids, and `next` option of an id: the `after` of the next page, or none at the end |
+| 4 | Taken | `id` of the block or transaction, and `known` flag: the node had it already |
+| 5 | Inventory | A list of at most 1,024 ids, and `next` option of an id: the last id listed, the `after` of the next page, or none at the end |
 | 6 | Items | A list of at most 32 items: `id`, `not_before` option of a `u64` (set for deferred ones), then `0` and the transaction as bytes, or `1` and its size `total` as a `u64` |
 | 7 | Addresses | A list of at most 32 addresses |
 
 An error answer's text is at most 1,024 bytes, cut at a character boundary.
 
-An Items answer carries transactions whole while each fits a slice and all of them
-together 8 MiB; the others it lists by size alone, to be fetched with
-`transaction_raw`.
+An Items answer carries transactions whole while all of them together fit one
+slice, 1 MiB, so that it arrives within its five seconds wherever a block's slice
+does; the others it lists by size alone, to be fetched with `transaction_raw`.
 
 ### The state
 
@@ -217,6 +225,12 @@ item ends the push with `slice out of order` or `empty slice`.
 
 - A block's first slice holds its header, which sets its bound: the data capacity at
   its height. A larger `total` is invalid data.
+- A reference node stores a pushed block only when it is executed at once, as one
+  whose branch overtakes its tip; one that does not, such as a sibling of its tip, it
+  holds in memory for the connection, answered Taken all the same, until the next
+  blocks pushed make the branch overtake ([pushed
+  blocks](../node/sync.md#pushed-blocks)). So push a branch whole, from the block you
+  share, in order.
 - A transaction is bounded by the data capacity of the next block, and a larger one
   is refused with `transaction larger than the data capacity`.
 - The whole item must arrive within its transfer time: a minute, and ten seconds
@@ -233,6 +247,12 @@ none, once for pooled and once for deferred transactions. Ask for the ones you l
 with `pending` or `deferred`, 32 ids at a time, and fetch any listed by size alone
 with `transaction_raw`. The reference node submits a peer's transactions to its own
 pool as relayed by that peer's address ([the mempool](../node/mining.md#the-mempool)).
+It reads a peer's inventory only until it holds as many ids as its own pool or
+deferred set can, and sends the peer nothing past the last id it read, since it
+cannot tell what the peer holds there. It sends each transaction to a peer, and
+fetches each from it, once a connection, whether or not it was taken; one refused
+with `mempool is full` or `deferred set is full` is tried again once its own tip
+has moved, at most the next block's data capacity of them each way at each tip.
 
 ## Errors
 
@@ -245,7 +265,7 @@ pool as relayed by that peer's address ([the mempool](../node/mining.md#the-memp
 | `block not found` | `raw` of a block the node does not serve |
 | `transaction not found` | `transaction_raw` of a transaction the node does not hold |
 | `no common ancestor` | `headers` whose locator names no canonical block |
-| `branch too far behind the tip` | A block on a branch more than a day's work behind the tip, whose header the node has not indexed |
+| `branch too far behind the tip` | A pushed block the node does not take now: on a branch more than a day's work behind the tip whose header it has not indexed, on a branch it does not store whole, or past what a connection holds unstored |
 | `timestamp ahead of the clock` | A block more than 7,200 seconds ahead of the node's clock; offer it again later |
 | `block marked invalid by this node's operator` | A block the operator marked invalid, or one above it; held against no peer |
 | `mempool is full`, `deferred set is full` | No room for the transaction |
@@ -253,6 +273,7 @@ pool as relayed by that peer's address ([the mempool](../node/mining.md#the-memp
 | `transaction larger than the data capacity` | A transaction beyond the next block's data capacity |
 | `transaction already included` | A recent block included the transaction |
 | `slice out of order`, `empty slice` | A push broke its order |
+| `the blocks this connection pushed were let go to make room; push them again from the block both nodes hold` | The node held the pushed blocks this one follows and let them go for others' ([pushed blocks](../node/sync.md#pushed-blocks)): connect again and push the branch from the block you share |
 
 Other texts may come from the node's own state, such as a storage error; they are
 answers too, and the connection stays open.
@@ -278,7 +299,8 @@ A reference node that connects to you sends, after its hello, in rounds:
 - `state`, then `import` of up to 32 of its blocks past your locator, when its tip
   has more work than yours;
 - `inventory`, `pending`, `deferred`, `transaction_raw` and `submit` to exchange
-  pooled and deferred transactions;
+  pooled and deferred transactions, when your pool or its own has changed and
+  every 30 seconds, at most once in two seconds and up to a second more at random;
 - `addresses` every ten seconds while it looks for peers, otherwise every ten
   minutes, when its discovery is on.
 
@@ -298,16 +320,37 @@ shown by `ting peers`; nothing depends on it.
 - Frames of 1 byte to 16 MiB, a `hello` frame of at most 4 KiB, and every field
   within its bound. A frame's buffer grows as its bytes arrive, so a length alone
   reserves nothing
+- On a connection it opened, a node holds at most 8 MiB and 8 KiB of frames ahead
+  of handling them, eight slices with their framing, or one frame if it is larger,
+  and one frame more, read whole, that waits for room among them: at most 32 MiB,
+  with frames of 16 MiB. Until it catches up, the rest waits in the peer's sending
 - Blocks and transactions larger than 1 MiB travel in slices of at most 1 MiB; a
   block of at most its height's data capacity and a transaction of at most the next
   block's, within its transfer time
-- 125 inbound connections at once, at most 8 of them from one address range (an IPv4
-  address or an IPv6 /64; the node's own machine excepted). With every slot taken, a
-  new connection takes the place of the newest one of the range holding the most, if
-  that range holds at least two more than the newcomer's; otherwise it is closed
+- 125 inbound connections at once unless the node's operator sets `max_inbound` (1
+  to 1,024), at most 8 of them from one address range (an IPv4 address or an IPv6
+  /64; the node's own machine excepted). With every slot taken, a new connection
+  takes the place of another that is at least ten seconds old, so that a new node
+  has the time to say `hello` and ask for `addresses`; and a connection whose
+  network group (an IPv4 /16 or an IPv6 /32, a local address its own range) took
+  another's place less than ten seconds ago is closed, so that one address or a few
+  networks cannot keep the newest place changing hands. The place taken is that of
+  the newest one of the network group holding the most, if that group holds at
+  least two more than the newcomer's, so many addresses of one operator's network
+  cannot hold every slot. Otherwise it is that of the connection least worth
+  keeping, after Bitcoin's eviction: the four connections that most recently pushed
+  a block the node did not have, and the longest connected half of the rest, keep
+  theirs, and of the others, the newest of the network group holding the most gives
+  way; of groups holding as many, the one whose newest connection is newest. A
+  newcomer from elsewhere never takes the place of a connection from the node's own
+  machine this way, and one from the node's own machine waits for nothing. A full
+  node therefore still takes new nodes. A connection that gives way is closed at
+  once, without an answer, even before its `hello`
 - 200 request units a second per inbound connection after a burst of 2,000, and 120
   seconds without a request before it is closed
-- At most 32 addresses in or from one `addresses` answer
+- At most 32 addresses in or from one `addresses` answer, the same answer to every
+  peer for an hour, and at most 32 addresses an hour learned from the peers of one
+  network group, shared or announced
 - Five seconds per connection attempt and per frame, 30 seconds per answer
 
 No message reaches administration: peer configuration, mining and shutdown exist

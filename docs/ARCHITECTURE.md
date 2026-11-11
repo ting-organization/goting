@@ -179,16 +179,38 @@ execution.
 
 The best header is the indexed header with the most work that is not invalid.
 Bodies are downloaded only along its branch. A body is stored once it matches
-its header's commitments. A branch is executed only when it becomes the best
-complete branch that overtakes the tip by the fork-choice margin (§8.2), most
-work first. A failure marks the block and its descendants invalid. Peers that
-delivered any of those blocks become offenders, and the node bans them.
+its header's commitments, and a block's header is indexed only then: a header
+alone moves the best header, and with it what the node downloads and whether
+its miner waits. A branch is executed only when it becomes the best complete
+branch that overtakes the tip by the fork-choice margin (§8.2), most work
+first. A failure marks the block and its descendants invalid, after the block
+has failed once more with every record read by its path in the stored tree: a
+block that passes then failed on the node's own damaged record table, and the
+node stops rather than blame anyone. Peers that delivered any of the invalid
+blocks become offenders, and the node bans them.
 
-Header chains with less work than the tip's minus 1,440 blocks are refused
-unless they are already indexed. A peer's headers below that threshold are
-checked without being kept, with a salted bit every 600 headers, and fetched
-again once they pass (presync). The operator's marks (`marks.json`) refuse a
-marked block and everything above it without blaming peers.
+What a peer can make the node keep is bounded by work beyond the best chain,
+not by work alone. Every child of one block has the same target, so a sibling
+of the tip costs its sender one block of work:
+
+- A header a peer shows is indexed only when its chain overtakes the best
+  header by the fork-choice margin of its own block. Any other is checked by a
+  pre-sync, which keeps no header: a salted bit every 600 headers, and the
+  chain fetched again and indexed once it overtakes the best header as it is
+  then. A page of headers begins at most one pre-sync, and a peer at most two
+  walks from new fork points in thirty seconds.
+- A block a peer pushes unasked is stored only when the node stores its whole
+  branch and the branch, with it, overtakes the tip: it is then executed at
+  once. Any other whose parent the node stores with its whole branch is
+  checked, header and body, and held in memory in one run per connection (16
+  MiB a run, 64 MiB in all, the largest other run giving way), answered as
+  taken. The block that makes the run overtake the tip stores and connects it
+  (`chain/pushed.go`).
+- Blocks the node stores itself, its own and those pushed whole, must lie
+  within 1,440 blocks of work of the tip.
+
+The operator's marks (`marks.json`) refuse a marked block and everything above
+it without blaming peers.
 
 Tip hooks (`OnTip`) run synchronously in the commit path, so the node's
 transaction and event indexes and its pool follow every tip. Subscribers
@@ -276,18 +298,53 @@ The `Server` answers inbound peers through a `Backend` (implemented by
 - Each connection is handled sequentially, which keeps answers in request
   order. Announcements are written between answers under the same write lock.
 - Request units are a token bucket per connection, charged by the ceiling of
-  bytes / 64 KiB.
+  bytes / 64 KiB, for the transactions a `pending` or `deferred` answer
+  carries as for a block's slices. The sorted listings of the pool's ids are
+  made at most five times a second.
 - A pushed block's header is checked on its first slice.
+- Inbound slots (`max_inbound`, 125): at most 8 from one address range. A full
+  node still takes newcomers, in place of the newest connection of the network
+  group (an IPv4 /16, an IPv6 /32) holding the most, or else of the one least
+  worth keeping: the four that last delivered a new block and the longest
+  connected half of the rest keep theirs. A connection settles for ten
+  seconds, and a group that took a place takes no other for as long.
 
 `node.Peers` keeps the outbound connections. Configured peers are always
 connected. Discovered peers come from the address book (`peers.json`, at most
 1,024), up to `max_peers` in all, from distinct /16 or /32 groups, with one
 more while the tip is stale. Each connection runs four loops:
 
-- the syncer;
+- the syncer, which asks for at most 8 MiB of block slices ahead of handling
+  them and ends a connection whose answer is larger than what was asked for;
 - a push loop that sends our blocks with `import` when our tip has more work;
-- a pool loop that compares pending and deferred inventories both ways;
+- a pool loop that compares pending and deferred inventories both ways, at
+  most once in two to three seconds, each transaction once a connection;
 - an address loop.
+
+The address book keeps at most 2 discovered addresses of one public IP address
+and 32 of one network group, takes at most 32 an hour from one group, and
+gives way among the least worth keeping at random. Every peer of the same
+reach is given the same `addresses` answer for an hour.
+
+The seeds are where a node starts, not peers to keep. Their names are looked
+up again every hour, their addresses stay in the book through a ban, and
+links to them take none of the `max_peers` slots. A node leaves them once its
+tip is within a block of its best header, it holds a seed's tip, and half of
+`max_peers` other peers are at tips as high as its best header and have not
+been caught lacking a block they claimed. It comes back when fewer than a
+quarter of `max_peers` such peers are left, or its tip has not moved for ten
+minutes.
+
+REST runs on its own listener wrapper (`node/apiserver.go`): 512 connections
+in all (fewer when the open-file limit leaves fewer beside peers and
+storage), 16 from one client, ten seconds for a header, an answer's transfer
+time to write it, and five minutes of idleness for a local reverse proxy's
+pooled connections. A request slot is held until the answer is written, and
+until the work ends when the deadline passes first.
+
+A panic in the handling of one peer or request ends that connection. If it
+left one of the node's locks held, the process exits to be started again,
+rather than hang with its listeners up.
 
 ## Where it scales and where it does not yet
 
@@ -305,7 +362,11 @@ Scales:
   (allocating a module's whole declared memory for every call had kept the
   garbage collector busier than the interpreter);
 - with a database, memory holds the window above the base, the header index
-  and caches, and restart time depends on the window, not the chain.
+  and caches, and restart time depends on the window, not the chain;
+- a long branch connects 256 blocks at a time with the base following, a move
+  of the base stops at 64 MiB of undo data, and neither walks the whole index;
+- the index, the block files and the address book grow only with work beyond
+  the best chain, never with what a peer merely sends.
 
 Measured on an Apple M3:
 
@@ -324,7 +385,12 @@ node; more peers multiply it.
 
 Not yet:
 
-- Every header stays in memory (about 500 bytes each). The reference keeps
-  only the headers above a settled height in memory.
+- Every header stays in memory, about 0.9 KB a block with its index
+  entries: about 1 GB at a million blocks (two years of the production
+  chain). The reference keeps only the headers above a settled height in
+  memory. Restart re-checks each stored header.
+- One block's undo data is gathered whole when the base moves past it, and a
+  rewind's in one commit. The reference moves each value a MiB at a time.
+- A transaction's occurrences are listed whole for `/v1/transactions/{id}`.
 - The interpreter checks compute before every instruction. Charging per
   straight-line run, or a register form, would speed it up.

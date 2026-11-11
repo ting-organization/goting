@@ -60,9 +60,11 @@ func TestOnlyProvenFreshAddressesShared(t *testing.T) {
 	if len(got) != 1 || got[0] != proven {
 		t.Fatalf("shared %v", got)
 	}
-	// A proven address older than a day is not shared.
+	// A proven address older than a day is not shared, once the answer is
+	// drawn again.
 	old := now() - shareFresh - 1
 	b.entries[proven].Verified = &old
+	clear(b.shared)
 	if got := b.Share(ip("5.5.5.5"), nil); slices.Contains(got, proven) {
 		t.Fatal("stale address shared")
 	}

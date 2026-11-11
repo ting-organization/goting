@@ -234,13 +234,47 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// behindWait decides how long the miner waits for its node to catch up with
+// its best header (reference node, wiki: node/mining). Mining on a tip about
+// to be replaced wastes the work, so the miner waits while the node is more
+// than a block behind; but headers cost their sender only their proof of
+// work, and a peer that shows two above the tip and never serves the blocks
+// would otherwise stop every miner for good. So the wait lasts only while
+// something moves: the tip, or the count of blocks stored, which a heavier
+// branch that forks below the tip raises long before it moves the tip. Once
+// neither has moved for a block's transfer time, the time a peer has to
+// deliver one before it is asked of another, there is no download behind the
+// headers and the miner mines. A replay that rebuilds undo data moves the
+// tip when it is done, and is waited for.
+type behindWait struct {
+	tip    hashing.Hash
+	stored int
+	since  time.Time // when the node fell behind, or last moved while behind
+}
+
+func (w *behindWait) waits(tip hashing.Hash, stored int, isBehind, replaying bool, patience time.Duration, now time.Time) bool {
+	// A side branch forgotten lowers the count: that is no progress.
+	moved := tip != w.tip || stored > w.stored
+	w.tip, w.stored = tip, stored
+	if !isBehind {
+		w.since = time.Time{}
+		return false
+	}
+	if w.since.IsZero() || moved || replaying {
+		w.since = now
+	}
+	return now.Sub(w.since) < patience
+}
+
 // mineLoop fetches a template, searches a slice of nonces on it and hands a
 // solution back, over and over: waiting out the spacing since its own last
 // canonical block, while the tip is more than a block behind the best
-// header, and while the next timestamp would be too far ahead for peers.
+// header and still moving toward it, and while the next timestamp would be
+// too far ahead for peers.
 func (n *Node) mineLoop(ctx context.Context, m *builtinMiner) {
 	var lastBlock time.Time
 	var start uint64
+	var behind behindWait
 	threads := m.threads
 	for ctx.Err() == nil {
 		if m.spacing > 0 && !lastBlock.IsZero() && time.Since(lastBlock) < m.spacing {
@@ -250,7 +284,9 @@ func (n *Node) mineLoop(ctx context.Context, m *builtinMiner) {
 			continue
 		}
 		tip := n.Chain.Tip()
-		if _, _, best := n.Chain.Counts(); best > tip.Height+1 {
+		_, stored, best := n.Chain.Counts()
+		if behind.waits(tip.ID, stored, best > tip.Height+1, n.Chain.Replaying(),
+			chain.TransferTime(n.nextLimits()[types.D]), time.Now()) {
 			m.fail(fmt.Sprintf("waiting: the node is %d blocks behind its best header", best-tip.Height))
 			if !sleepCtx(ctx, 500*time.Millisecond) {
 				return

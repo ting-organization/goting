@@ -32,13 +32,28 @@ type Result struct {
 	err error
 }
 
+// waiter is a request in flight: where its answer goes, and the most bytes
+// the answer's frame may have (0: any frame).
+type waiter struct {
+	ch   chan Result
+	most int
+}
+
+// ReadAhead is the most bytes of block slices a connection asks for ahead
+// of handling them (the reference node reads 8 MiB of frames ahead): what a
+// peer that answers faster than blocks are checked can make the node hold.
+const ReadAhead = 8 << 20
+
+// sliceFraming is more than a slice answer's bytes besides its payload.
+const sliceFraming = 64
+
 // Conn is a connection this node opened: it asks, the peer answers, in
 // order. Many requests may be in flight; answers are matched to them in
 // the order they were sent.
 type Conn struct {
 	nc      net.Conn
 	wmu     sync.Mutex
-	waiters chan chan Result
+	waiters chan waiter
 	// Announcements receives the peer's announcements when the hello asked
 	// for them. Slow readers miss some; only the latest matters.
 	Announcements chan *Announcement
@@ -59,7 +74,7 @@ func Dial(ctx context.Context, addr string, hello *Hello) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &Conn{nc: nc, waiters: make(chan chan Result, MaxPipeline),
+	c := &Conn{nc: nc, waiters: make(chan waiter, MaxPipeline),
 		Announcements: make(chan *Announcement, 16), done: make(chan struct{})}
 	// The hello's answer is due within one frame deadline, as the
 	// reference node asks of its peers.
@@ -139,6 +154,13 @@ func (c *Conn) fail(err error) {
 }
 
 func (c *Conn) readLoop() {
+	// A fault in handling one peer's frames ends that connection, not the
+	// node.
+	defer func() {
+		if v := recover(); v != nil {
+			c.fail(fmt.Errorf("reading from the peer panicked: %v", v))
+		}
+	}()
 	for {
 		p, err := ReadFrame(c.nc, MaxFrame)
 		if err != nil {
@@ -157,21 +179,29 @@ func (c *Conn) readLoop() {
 			}
 			continue
 		}
-		var w chan Result
+		var w waiter
 		select {
 		case w = <-c.waiters:
 		default:
 			c.fail(fmt.Errorf("%w: answer without a request", ErrNotMessage))
 			return
 		}
-		m, err := DecodeAnswer(p)
-		var ea *ErrorAnswer
-		if err != nil && !errors.As(err, &ea) {
-			w <- Result{err: err}
+		if w.most > 0 && len(p) > w.most {
+			// More than was asked for: what bounds the answers held ahead
+			// of handling them would not hold.
+			err := fmt.Errorf("%w: answer of %d bytes to a request for at most %d", ErrNotMessage, len(p), w.most)
+			w.ch <- Result{err: err}
 			c.fail(err)
 			return
 		}
-		w <- Result{msg: m, err: err}
+		m, err := DecodeAnswer(p)
+		var ea *ErrorAnswer
+		if err != nil && !errors.As(err, &ea) {
+			w.ch <- Result{err: err}
+			c.fail(err)
+			return
+		}
+		w.ch <- Result{msg: m, err: err}
 	}
 }
 
@@ -184,7 +214,10 @@ func (c *Conn) keepAlive() {
 			return
 		case <-t.C:
 			if time.Since(time.Unix(0, c.lastReq.Load())) >= KeepAlive {
-				go c.Do(context.Background(), &StateRequest{})
+				go func() {
+					defer func() { recover() }() //nolint:errcheck // a keep-alive has nothing to lose
+					c.Do(context.Background(), &StateRequest{})
+				}()
 			}
 		}
 	}
@@ -192,14 +225,44 @@ func (c *Conn) keepAlive() {
 
 // Send writes a request and returns a channel for its answer, so callers
 // can pipeline.
-func (c *Conn) Send(req Message) (<-chan Result, error) {
+func (c *Conn) Send(req Message) (<-chan Result, error) { return c.send(req, maxAnswer(req)) }
+
+// maxAnswer is the most bytes an honest answer to a request has. An answer
+// waits in memory until the task that asked takes it, and several tasks ask
+// at once, so a peer must not be able to answer each with a frame of 16
+// MiB. An error answer fits every bound.
+func maxAnswer(req Message) int {
+	const framing = 4 << 10 // tags, counts, an agent, an error's text
+	switch r := req.(type) {
+	case *RawRequest:
+		return int(r.Length) + sliceFraming
+	case *TransactionRawRequest:
+		return int(r.Length) + sliceFraming
+	case *StateRequest:
+		return framing + 32*(MaxLocator+2*MaxPoolIDs)
+	case *HeadersRequest:
+		return framing + MaxHeaders*294
+	case *InventoryRequest:
+		return framing + 32*MaxInventory
+	case *AddressesRequest:
+		return framing + 32*MaxAddresses
+	case *Import, *Submit:
+		return framing
+	case *PendingRequest, *DeferredRequest:
+		// A launch-era node carries up to 8 MiB of transactions whole.
+		return MaxFrame/2 + 64<<10
+	}
+	return 0
+}
+
+func (c *Conn) send(req Message, most int) (<-chan Result, error) {
 	w := make(chan Result, 1)
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	select {
 	case <-c.done:
 		return nil, c.Err()
-	case c.waiters <- w:
+	case c.waiters <- waiter{ch: w, most: most}:
 	}
 	c.lastReq.Store(time.Now().UnixNano())
 	c.nc.SetWriteDeadline(time.Now().Add(AnswerTimeout))

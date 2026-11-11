@@ -38,8 +38,17 @@ type Syncer struct {
 	Peer string
 	// OnBlock, when set, sees every block this syncer stores.
 	OnBlock func(e *chain.Entry, raw []byte)
+	// OnAnnounce sees the peer's announcements; OnMissing is told when the
+	// peer says it does not have a block it was asked for; OnNoHeaders when
+	// it shows no headers past this node's own locator.
+	OnAnnounce  func(a *Announcement)
+	OnMissing   func()
+	OnNoHeaders func(locator []hashing.Hash)
 	// next is where the next headers request continues.
 	next *hashing.Hash
+	// retry is when a block the peer said it does not have may be asked of
+	// it again.
+	retry time.Time
 }
 
 func (s *Syncer) log() *slog.Logger {
@@ -63,6 +72,7 @@ func (s *Syncer) Run(ctx context.Context, c *Conn) error {
 	t := time.NewTicker(KeepAlive)
 	defer t.Stop()
 	for {
+		released := s.Chain.Released()
 		more, _, err := s.round(ctx, c)
 		if err != nil {
 			return err
@@ -70,12 +80,32 @@ func (s *Syncer) Run(ctx context.Context, c *Conn) error {
 		if more {
 			continue
 		}
+		// Nothing wakes a connection by itself when the time ends in which
+		// a peer is not asked again for a block it lacked.
+		var again <-chan time.Time
+		if d := time.Until(s.retry); d > 0 {
+			again = time.After(d + 100*time.Millisecond)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.Done():
 			return c.Err()
-		case <-c.Announcements:
+		case a := <-c.Announcements:
+			if s.OnAnnounce != nil && a != nil {
+				s.OnAnnounce(a)
+			}
+		case <-released:
+			// Blocks went back from another peer: at most a round a second
+			// for them, however often that happens.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.Done():
+				return c.Err()
+			case <-time.After(time.Second):
+			}
+		case <-again:
 		case <-t.C:
 		}
 	}
@@ -129,6 +159,9 @@ func (s *Syncer) headers(ctx context.Context, c *Conn) (bool, error) {
 			return false, fmt.Errorf("%w: headers answered with another message", ErrNotMessage)
 		}
 		if len(hs.Headers) == 0 {
+			if s.next == nil && s.OnNoHeaders != nil {
+				s.OnNoHeaders(locator)
+			}
 			s.next = nil
 			return false, nil
 		}
@@ -172,6 +205,9 @@ func (s *Syncer) pinSeed(hs *Headers) error {
 	if s.Pin.Height < first || s.Pin.Height > last || first != 1 {
 		return nil
 	}
+	if uint64(len(hs.Raw)) < s.Pin.Height || uint64(len(hs.Headers)) < s.Pin.Height {
+		return nil // the heights the peer's headers claim are not their places
+	}
 	list := make([]hashing.Hash, s.Pin.Height)
 	for i := range list {
 		list[i] = types.HeaderIDFromBytes(hs.Raw[i])
@@ -193,12 +229,16 @@ func (s *Syncer) pinSeed(hs *Headers) error {
 type download struct {
 	id    hashing.Hash
 	max   uint64
+	asked int // the bytes of the first slice asked for
 	ans   <-chan Result
 	start time.Time
 }
 
 // blocks fetches what the chain wants of this peer, as long as it wants
-// more, with up to MaxPipeline slices asked at once.
+// more, with up to MaxPipeline slices asked at once and no more than
+// ReadAhead bytes of them: answers arrive as fast as the peer sends them,
+// blocks are checked one at a time, and what waits between is held in
+// memory.
 func (s *Syncer) blocks(ctx context.Context, c *Conn) (int, error) {
 	total := 0
 	for {
@@ -207,27 +247,37 @@ func (s *Syncer) blocks(ctx context.Context, c *Conn) (int, error) {
 			return total, nil
 		}
 		var queue []download
-		next := 0
+		next, ahead := 0, 0
 		for next < len(wanted) || len(queue) > 0 {
 			for next < len(wanted) && len(queue) < MaxPipeline-1 {
-				w, err := c.Send(&RawRequest{ID: wanted[next].ID, Length: MaxSlice})
+				length := int(min(max(wanted[next].Max, 1), MaxSlice))
+				if len(queue) > 0 && ahead+length > ReadAhead {
+					break
+				}
+				w, err := c.Send(&RawRequest{ID: wanted[next].ID, Length: uint32(length)})
 				if err != nil {
 					return total, err
 				}
-				queue = append(queue, download{id: wanted[next].ID, max: wanted[next].Max, ans: w, start: time.Now()})
+				queue = append(queue, download{id: wanted[next].ID, max: wanted[next].Max, asked: length, ans: w, start: time.Now()})
+				ahead += length
 				next++
 			}
 			d := queue[0]
 			queue = queue[1:]
+			ahead -= d.asked
 			raw, err := s.collect(ctx, c, d)
 			var ea *ErrorAnswer
 			if errors.As(err, &ea) && ea.Text == "block not found" {
-				// The peer does not have it: the others are asked, and this
-				// one again after its next announcement.
+				// The peer does not have it: the others are asked at once,
+				// and this one again in a moment.
 				for _, q := range queue {
 					c.Wait(ctx, q.ans)
 				}
-				s.Chain.Release(s.peer())
+				s.Chain.Missing(s.peer(), d.id)
+				s.retry = time.Now().Add(10 * time.Second)
+				if s.OnMissing != nil {
+					s.OnMissing()
+				}
 				return total, nil
 			}
 			if err != nil {

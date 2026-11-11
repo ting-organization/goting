@@ -37,6 +37,29 @@ type walk struct {
 	work      *big.Int
 }
 
+// keptWalk is the walk a peer's pre-sync last began with, and when its last
+// walks from other blocks began: a walk covers up to a voting epoch of
+// blocks, and a header too far behind costs its proof of work once and can
+// be sent again for ever.
+type keptWalk struct {
+	start *Entry
+	first *walk
+	began [walksAllowed]time.Time
+}
+
+const (
+	// walksAllowed walks from new blocks may begin for one peer within
+	// walkWait; a walk from the same block as the last reuses it.
+	walksAllowed = 2
+	walkWait     = 30 * time.Second
+)
+
+// errWalkWait ends a page whose pre-sync would begin a walk too soon.
+var errWalkWait = errors.New("pre-sync walks begin too often")
+
+// errOvertaken ends a pre-sync whose chain the best header passed.
+var errOvertaken = errors.New("the chain no longer overtakes the best header")
+
 // walkFrom starts a walk at an indexed entry. Called with c.mu held.
 func (c *Chain) walkFrom(e *Entry) *walk {
 	w := &walk{height: e.Height, id: e.ID, timestamp: e.Timestamp, vote: e.Vote,
@@ -96,12 +119,12 @@ type presyncState struct {
 	first      *walk
 	walk       *walk
 	last       hashing.Hash
+	lastWork   *big.Int // the work of the last header of the first pass
 	count      uint64
 	salt       [32]byte
 	offset     uint64
 	bits       []bool
 	most       uint64
-	threshold  *big.Int
 	refetching bool
 	rwalk      *walk
 	rcount     uint64
@@ -113,8 +136,33 @@ func presyncBit(salt *[32]byte, id hashing.Hash) bool {
 	return hashing.H("presync", salt[:], id[:])[0]&1 == 1
 }
 
-func (c *Chain) newPresync(start *Entry, threshold *big.Int) *presyncState {
-	p := &presyncState{start: start, first: c.walkFrom(start), last: start.ID, threshold: threshold}
+// newPresync begins a pre-sync of peer's chain from start. The walk back
+// from start is the one kept for the peer if it began there; a walk from
+// another block may begin only walksAllowed times in walkWait.
+func (c *Chain) newPresync(peer string, start *Entry) (*presyncState, error) {
+	c.mu.Lock()
+	kept := c.walks[peer]
+	c.mu.Unlock()
+	if kept == nil || kept.start != start {
+		t := c.cfg.Clock()
+		var began [walksAllowed]time.Time
+		if kept != nil {
+			began = kept.began
+			if t.Sub(began[0]) < walkWait && !began[0].IsZero() {
+				return nil, errWalkWait
+			}
+		}
+		copy(began[:], began[1:])
+		began[walksAllowed-1] = t
+		c.mu.RLock()
+		first := c.walkFrom(start)
+		c.mu.RUnlock()
+		kept = &keptWalk{start: start, first: first, began: began}
+		c.mu.Lock()
+		c.walks[peer] = kept
+		c.mu.Unlock()
+	}
+	p := &presyncState{start: start, first: kept.first, last: start.ID}
 	p.walk = p.first.clone()
 	rand.Read(p.salt[:])
 	var ob [8]byte
@@ -126,7 +174,16 @@ func (c *Chain) newPresync(start *Entry, threshold *big.Int) *presyncState {
 	} else {
 		p.most = presyncPeriod
 	}
-	return p
+	return p, nil
+}
+
+// overtakes reports whether the chain a pre-sync checked, as its first pass
+// left it, overtakes the best header as it is now by the fork-choice margin
+// of its last header.
+func (p *presyncState) overtakes(c *Chain) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return p.lastWork != nil && exceeds(p.walk.work, p.lastWork, c.best.ChainWork)
 }
 
 func (p *presyncState) follows(h *types.Header) bool {
@@ -163,6 +220,11 @@ func (c *Chain) HeadersFrom(peer string, headers []*types.Header) (HeaderResult,
 	defer c.processMu.Unlock()
 	var res HeaderResult
 	set := func(id hashing.Hash) { v := id; res.Next = &v }
+	// An honest page is one chain: the header that begins a pre-sync is
+	// followed by headers that continue it. So a page begins at most one,
+	// and a second header too far behind that does not follow it ends the
+	// page, with no next header to ask for.
+	began := false
 	for _, h := range headers {
 		id := h.ID()
 		c.mu.RLock()
@@ -187,9 +249,19 @@ func (c *Chain) HeadersFrom(peer string, headers []*types.Header) (HeaderResult,
 				res.Refetch = true
 				return res, nil
 			case presyncIndex, presyncDone:
+				// Indexed only while the whole chain, as the first pass
+				// checked it, still overtakes the best header as it is
+				// now: a kept header never ties the best one.
+				if !ps.overtakes(c) {
+					c.mu.Lock()
+					delete(c.presync, peer)
+					c.mu.Unlock()
+					res.Next = nil
+					return res, errOvertaken
+				}
 				for _, hh := range ps.held {
 					if _, ok := c.Get(hh.ID()); !ok {
-						if _, err := c.acceptHeader(hh, hh.ID(), false, true); err != nil {
+						if _, err := c.acceptHeader(hh, hh.ID(), admitPresynced); err != nil {
 							return res, err
 						}
 						res.Indexed++
@@ -214,19 +286,25 @@ func (c *Chain) HeadersFrom(peer string, headers []*types.Header) (HeaderResult,
 			set(id)
 			continue
 		}
-		_, err := c.acceptHeader(h, id, false, false)
+		_, err := c.acceptHeader(h, id, admitSynced)
 		switch {
 		case err == nil:
 			res.Indexed++
 			set(id)
 		case errors.Is(err, ErrBehind):
+			if began {
+				res.Next = nil
+				return res, nil
+			}
+			began = true
 			c.mu.RLock()
 			start := c.entries[h.ParentID]
-			th := c.threshold()
 			c.mu.RUnlock()
-			c.mu.Lock()
-			ps := c.newPresync(start, th)
-			c.mu.Unlock()
+			ps, err := c.newPresync(peer, start)
+			if err != nil {
+				res.Next = nil
+				return res, nil
+			}
 			out, err := c.presyncAdd(peer, ps, h, id)
 			if err != nil {
 				return res, err
@@ -268,10 +346,13 @@ func (c *Chain) presyncAdd(peer string, p *presyncState, h *types.Header, id has
 		}
 		p.count++
 		p.last = id
+		p.lastWork = consensus.Work(h.Target)
 		if p.count > p.most {
 			return 0, fmt.Errorf("more headers than the clock allows")
 		}
-		if p.walk.work.Cmp(p.threshold) >= 0 {
+		// Judged against the best header as it is when each header
+		// arrives, by that header's own margin.
+		if p.overtakes(c) {
 			p.refetching = true
 			p.rwalk = p.first.clone()
 			p.rcount = 0
@@ -314,6 +395,14 @@ const (
 	downloadWindow = 1024
 	perPeer        = 64
 	lapsedWait     = 120 * time.Second
+	// missingWait is how long a peer that said it does not have a block is
+	// not asked for it again: long enough for the other connections, told at
+	// once, to take the block first; short, since a peer that lacked a block
+	// a moment ago, as one that had not yet executed it, may have it now and
+	// be the only one that does.
+	missingWait = 10 * time.Second
+	// maxBarred bounds the remembered (block, peer) pairs.
+	maxBarred = 1 << 16
 )
 
 // TransferTime is how long a block or transaction of at most capacity bytes
@@ -341,18 +430,18 @@ func (c *Chain) BlocksWanted(peer string) []Wanted {
 		e := c.entries[id]
 		if e == nil || now.Sub(f.since) > TransferTime(e.Vote.Limits[types.D]) {
 			delete(c.inFlight, id)
-			c.expired[id] = flight{peer: f.peer, since: now}
+			c.bar(id, f.peer, now.Add(lapsedWait))
 		}
 	}
-	for id, f := range c.expired {
-		if now.Sub(f.since) > lapsedWait {
-			delete(c.expired, id)
+	for b, until := range c.barred {
+		if !now.Before(until) {
+			delete(c.barred, b)
 		}
 	}
 	c.advanceFrontier()
 	var out []Wanted
 	want := func(e *Entry) {
-		if f, ok := c.expired[e.ID]; ok && f.peer == peer {
+		if _, ok := c.barred[bar{e.ID, peer}]; ok {
 			return
 		}
 		if f, ok := c.inFlight[e.ID]; ok && f.peer != peer {
@@ -382,15 +471,66 @@ func (c *Chain) BlocksWanted(peer string) []Wanted {
 	return out
 }
 
-// Release returns a peer's blocks in flight to the others, as when it
-// answers that it does not have one.
-func (c *Chain) Release(peer string) {
+// bar keeps a block from being asked of a peer until a time. Called with
+// c.mu held.
+func (c *Chain) bar(id hashing.Hash, peer string, until time.Time) {
+	if len(c.barred) >= maxBarred {
+		clear(c.barred) // only costs asking a peer again
+	}
+	c.barred[bar{id, peer}] = until
+}
+
+// wake tells the connections that blocks went back to them. Called with
+// c.mu held.
+func (c *Chain) wake() {
+	close(c.released)
+	c.released = make(chan struct{})
+}
+
+// Released returns a channel closed when blocks next go back to the other
+// peers: a connection that waits on it asks for them at once.
+func (c *Chain) Released() <-chan struct{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.released
+}
+
+// Missing records that a peer said it does not have a block it was asked
+// for: the block is not asked of it again for a moment, whatever tip it
+// announces, and what it was asked for goes back to the others at once.
+// Its pre-sync stays: only a connection that ended gives that up.
+func (c *Chain) Missing(peer string, id hashing.Hash) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.bar(id, peer, c.cfg.Clock().Add(missingWait))
 	for id, f := range c.inFlight {
 		if f.peer == peer {
 			delete(c.inFlight, id)
 		}
 	}
+	c.wake()
+}
+
+// Release returns a peer's blocks in flight to the others and ends its
+// pre-sync, as when its connection ends.
+func (c *Chain) Release(peer string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	freed := false
+	for id, f := range c.inFlight {
+		if f.peer == peer {
+			delete(c.inFlight, id)
+			freed = true
+		}
+	}
+	for b := range c.barred {
+		if b.peer == peer {
+			delete(c.barred, b)
+		}
+	}
 	delete(c.presync, peer)
+	delete(c.walks, peer)
+	if freed {
+		c.wake()
+	}
 }

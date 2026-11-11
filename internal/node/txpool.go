@@ -106,9 +106,15 @@ type txPool struct {
 	maxCount int
 	maxMiB   int
 
-	// FirstIn selection state.
+	// FirstIn selection state: the templates selected so far, and for each
+	// address range in the pool its place in the queue, the template in which
+	// it last had its turn (or the one before the template that first found
+	// it in the pool).
 	turn    uint64
 	sources map[netip.Addr]uint64
+
+	// listed caches the sorted ids, pending and deferred (see sortedIDs).
+	listed [2]idList
 
 	deferredNext uint64
 	deferredTip  hashing.Hash
@@ -131,6 +137,47 @@ func newTxPool(maxCount, maxMiB int, path string) *txPool {
 }
 
 func now() uint64 { return uint64(time.Now().Unix()) }
+
+// idsLife is how long a sorted listing of the pool's or the deferred set's
+// ids is used again. Every state answer and inventory page of every peer
+// reads one, and sorting some 5,000 ids for each would let peers spend
+// cores for a few request units; announcements are no fresher than this.
+const idsLife = 200 * time.Millisecond
+
+type idList struct {
+	ids  []hashing.Hash
+	made time.Time
+}
+
+// sortedIDs lists, in id order, the pooled ids that are not deferred
+// entries, or the deferred set's. The list is shared: callers must not
+// change it.
+func (p *txPool) sortedIDs(deferred bool) []hashing.Hash {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l := &p.listed[0]
+	if deferred {
+		l = &p.listed[1]
+	}
+	if l.ids != nil && time.Since(l.made) < idsLife {
+		return l.ids
+	}
+	all := make([]hashing.Hash, 0, len(p.byID)+len(p.deferred))
+	if deferred {
+		for id := range p.deferred {
+			all = append(all, id)
+		}
+	} else {
+		for id := range p.byID {
+			if _, d := p.deferred[id]; !d {
+				all = append(all, id)
+			}
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return bytes.Compare(all[i][:], all[j][:]) < 0 })
+	l.ids, l.made = all, time.Now()
+	return all
+}
 
 func (p *txPool) notify() {
 	if p.changed != nil {
@@ -195,14 +242,25 @@ func (p *txPool) fits(n, most int) bool {
 	return len(p.items) < p.maxCount && p.bytes+n <= most
 }
 
+// sourceRange is the range an address counts in: an IPv4 address or an IPv6
+// /64, as bans and inbound limits count them. One subscriber holds a whole
+// /64, so its addresses share one place in the pool, the deferred set and
+// the templates' turns. The node's own submissions (no address) stay apart.
+func sourceRange(a netip.Addr) netip.Addr {
+	if !a.IsValid() {
+		return a
+	}
+	return banKey(a)
+}
+
 // fairShare picks the transaction that gives way in a full pool: the most
-// recent of the address holding the most, if that address holds more than
-// the newcomer's. The node's own transactions never give way.
+// recent of the address range holding the most, if that range holds more
+// than the newcomer's. The node's own transactions never give way.
 func fairShare(pool []*Pooled, incoming netip.Addr) int {
 	held := map[netip.Addr]int{}
 	for _, it := range pool {
 		if it.Source.IsValid() {
-			held[it.Source]++
+			held[sourceRange(it.Source)]++
 		}
 	}
 	if len(held) == 0 {
@@ -222,13 +280,13 @@ func fairShare(pool []*Pooled, incoming netip.Addr) int {
 	}
 	own := 0
 	if incoming.IsValid() {
-		own = held[incoming]
+		own = held[sourceRange(incoming)]
 	}
 	if count <= own {
 		return -1
 	}
 	for i := len(pool) - 1; i >= 0; i-- {
-		if pool[i].Source == largest {
+		if pool[i].Source.IsValid() && sourceRange(pool[i].Source) == largest {
 			return i
 		}
 	}
@@ -250,32 +308,37 @@ func (p *txPool) makeRoom(n int, source netip.Addr, most int) bool {
 	return true
 }
 
-// turns orders the pool for a template: transactions no template ran first,
-// then those run longest ago; among equals the first of each address before
-// the second of any, the addresses tried longest ago first, then arrival.
+// turns orders the pool for a template (reference node, wiki: node/mining):
+// the first transaction of each address range before the second of any;
+// among equals the ranges by their place in the queue (sources: the template
+// in which a range last had its turn, lowest first; a range missing from it
+// comes last), and arrival order within that. No transaction goes first for
+// being new: one that fills a block and fails, which costs its sender
+// nothing, buys its range a single turn.
 func turns(pool []*Pooled, sources map[netip.Addr]uint64) []int {
 	type key struct {
-		tried uint64
 		rank  int
-		last  uint64
+		place uint64
 		at    int
 	}
 	seen := map[netip.Addr]int{}
 	keys := make([]key, len(pool))
 	for i, it := range pool {
-		seen[it.Source]++
-		keys[i] = key{it.Tried, seen[it.Source], sources[it.Source], i}
+		r := sourceRange(it.Source)
+		seen[r]++
+		place, ok := sources[r]
+		if !ok {
+			place = ^uint64(0)
+		}
+		keys[i] = key{seen[r], place, i}
 	}
 	sort.Slice(keys, func(i, j int) bool {
 		a, b := keys[i], keys[j]
-		if a.tried != b.tried {
-			return a.tried < b.tried
-		}
 		if a.rank != b.rank {
 			return a.rank < b.rank
 		}
-		if a.last != b.last {
-			return a.last < b.last
+		if a.place != b.place {
+			return a.place < b.place
 		}
 		return a.at < b.at
 	})
@@ -366,9 +429,10 @@ func (p *txPool) submitDeferred(id hashing.Hash, raw []byte, tx *types.Transacti
 		return nil, ErrHorizon
 	}
 	if source.IsValid() {
-		count := 0
+		// By address range, so one IPv6 /64 holds one share of the set.
+		count, r := 0, sourceRange(source)
 		for _, d := range p.deferred {
-			if d.Source == source {
+			if d.Source.IsValid() && sourceRange(d.Source) == r {
 				count++
 			}
 		}
@@ -732,10 +796,12 @@ func (n *Node) loadDeferred() {
 		var src netip.Addr
 		if e.Source != nil {
 			src, _ = netip.ParseAddr(*e.Source)
-			if perSource[src] >= DeferredPerSource {
-				continue
+			if r := sourceRange(src); src.IsValid() {
+				if perSource[r] >= DeferredPerSource {
+					continue
+				}
+				perSource[r]++
 			}
-			perSource[src]++
 		}
 		id := types.TransactionID(n.Chain.ChainID(), raw)
 		if n.succeededAbove(id, e.Since) {

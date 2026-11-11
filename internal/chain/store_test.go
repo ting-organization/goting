@@ -161,3 +161,58 @@ func TestBlockFilesForget(t *testing.T) {
 		t.Fatalf("frames after the cursor: %v", after)
 	}
 }
+
+// A new segment left zero-filled or short by a power loss, its header never
+// written out, gets its header again; a torn length is not trusted further
+// than the file goes.
+func TestBlockFilesAfterPowerLoss(t *testing.T) {
+	g := types.DevelopmentGenesis()
+	dir := filepath.Join(t.TempDir(), "blocks")
+	src := newChain(t, nil)
+	raws := mineEmpty(t, src, 2, g.GenesisTimestamp+60, 60, "files")
+	s, err := chain.OpenFileStore(dir, g.ChainID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := types.HeaderIDFromBytes(raws[0][:types.HeaderSize])
+	if err := s.Put(id, raws[0]); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	// A length of a terabyte, then nothing.
+	seg := filepath.Join(dir, "00000000.dat")
+	f, _ := os.OpenFile(seg, os.O_WRONLY|os.O_APPEND, 0)
+	f.Write([]byte{0, 0, 0, 0, 0, 1, 0, 0})
+	f.Close()
+	// A second segment of zeros.
+	next := filepath.Join(dir, "00000001.dat")
+	if err := os.WriteFile(next, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err = chain.OpenFileStore(dir, g.ChainID())
+	if err != nil {
+		t.Fatalf("a zero-filled new segment keeps the node from starting: %v", err)
+	}
+	if !s.Has(id) {
+		t.Fatal("the block before the damage is gone")
+	}
+	id2 := types.HeaderIDFromBytes(raws[1][:types.HeaderSize])
+	if err := s.Put(id2, raws[1]); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = chain.OpenFileStore(dir, g.ChainID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got, err := s.Get(id2); err != nil || len(got) != len(raws[1]) {
+		t.Fatalf("a block written after the repair: %v", err)
+	}
+	// A segment with another header is still refused.
+	s.Close()
+	os.WriteFile(next, append([]byte("NOTTING\x00"), make([]byte, 64)...), 0o644)
+	if _, err := chain.OpenFileStore(dir, g.ChainID()); err == nil {
+		t.Fatal("a foreign file was taken for a block file")
+	}
+}

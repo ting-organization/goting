@@ -89,7 +89,7 @@ func (c *Chain) restoreRows() error {
 		if have {
 			return nil
 		}
-		e, err := c.acceptHeader(h, r.ID, true, true)
+		e, err := c.acceptHeader(h, r.ID, admitRecovered)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrUnknownParent), errors.Is(err, ErrInvalid), errors.Is(err, ErrMarked):
@@ -226,10 +226,37 @@ func (c *Chain) Settle() error {
 	return nil
 }
 
-// flush writes the canonical blocks above the base up to target and makes
-// target the base. Called with processMu held.
-func (c *Chain) flush(target *Entry) (err error) {
+// flushBytes is the most undo data one commit gathers before it stops at
+// the block it has reached. A delete costs two state accesses whatever the
+// size of the record it removes, so nothing a block pays bounds the values
+// it replaces: a window of blocks deleting state gathered over many would
+// otherwise be held, and written, all at once.
+const flushBytes = 64 << 20
+
+// flush writes the blocks above the base up to target and makes target the
+// base, in as many commits as their undo data needs. Called with processMu
+// held.
+func (c *Chain) flush(target *Entry) error {
+	for {
+		reached, err := c.flushStep(target)
+		if err != nil || reached == target {
+			return err
+		}
+	}
+}
+
+// flushStep moves the base toward target, as far as one commit's undo data
+// allows, and returns the block that is now the base.
+func (c *Chain) flushStep(target *Entry) (reached *Entry, err error) {
 	defer state.Recover(&err)
+	if err := c.flushTo(&target); err != nil {
+		return nil, err
+	}
+	return target, nil
+}
+
+func (c *Chain) flushTo(to **Entry) error {
+	target := *to
 	c.mu.RLock()
 	base := c.base
 	baseTree := *base.state
@@ -245,6 +272,7 @@ func (c *Chain) flush(target *Entry) (err error) {
 	t := baseTree
 	keys := map[state.Key]struct{}{}
 	undo := make([]db.BlockUndo, 0, len(blocks))
+	gathered := 0
 	var occurrences []db.Occurrence
 	var eventRows []db.EventRow
 	for i := len(blocks) - 1; i >= 0; i-- {
@@ -265,13 +293,23 @@ func (c *Chain) flush(target *Entry) (err error) {
 		for _, ch := range changes {
 			keys[ch.Key] = struct{}{}
 		}
-		undo = append(undo, undoFor(prev, b, changes))
+		u := undoFor(prev, b, changes)
+		for j := range u.Prev {
+			gathered += len(u.Prev[j].Value) + len(changes[j].Value)
+		}
+		undo = append(undo, u)
 		occ, events, err := c.indexRows(b)
 		if err != nil {
 			return err
 		}
 		occurrences = append(occurrences, occ...)
 		eventRows = append(eventRows, events...)
+		if gathered > flushBytes && i > 0 {
+			// Enough for one commit: the base stops here for now.
+			target = b
+			*to = b
+			break
+		}
 	}
 	if t.Root() != target.Header.StateRoot {
 		return fmt.Errorf("state to flush at height %d has root %s, its header %s", target.Height, t.Root(), target.Header.StateRoot)
@@ -370,18 +408,19 @@ func (c *Chain) rebase(newBase *Entry, b db.Base) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Every entry that holds changes is a retained one (connect and
+	// stateAt set both), so the change lists that go are found there, not
+	// by a walk of the whole index at every move of the base.
 	for e := range c.retained {
 		e.state = nil
+		if rebuilt[e] == nil {
+			e.changes = nil
+		}
 		delete(c.retained, e)
 	}
 	for e, t := range rebuilt {
 		e.state = t
 		c.retained[e] = struct{}{}
-	}
-	for _, e := range c.entries {
-		if e.changes != nil && rebuilt[e] == nil {
-			e.changes = nil
-		}
 	}
 	newBase.changes = nil
 	c.base = newBase

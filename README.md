@@ -75,10 +75,13 @@ Runs the node in the background with output to `node.log`. It waits until the
 node answers, then prints its status. `ting run` runs it in the foreground;
 `ting stop` stops it.
 
-On production, a node finds the network through the built-in seed node with no
-peer configured. It keeps up to `max_peers` (8) connections from distinct
-network groups, shares proven addresses, and bans peers that send invalid data
-for a day, by range.
+On production, a node finds the network through the built-in seed nodes
+(`node1.ting-node.com` and `node2.ting-node.com`, looked up again every hour)
+with no peer configured. It keeps up to `max_peers` (8) connections from
+distinct network groups, leaves the seeds once it has caught up and enough
+other peers can serve it, shares proven addresses, and bans peers that send
+invalid data for a day, by range. It takes up to `max_inbound` (125) inbound
+connections.
 
 ```bash
 bin/ting status
@@ -129,7 +132,7 @@ Operator marks, kept in `marks.json`. The node leaves a marked block and every
 block above it, and refuses them from peers without banning the peers.
 
 ```bash
-bin/ting probe 2.29.97.212:18442
+bin/ting probe node1.ting-node.com:18442
 ```
 
 Says hello over the peer protocol and shows the answer.

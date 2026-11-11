@@ -10,7 +10,10 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"runtime/debug"
+	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ting-organization/goting/internal/hashing"
@@ -29,13 +32,15 @@ type Backend interface {
 	// CheckHeader checks the header of a block a peer starts pushing:
 	// whether the block is stored already, or the data capacity that bounds
 	// it. An *InvalidData error proves the peer broke the rules.
-	CheckHeader(header []byte) (known bool, id hashing.Hash, max uint64, err error)
+	CheckHeader(header []byte, from netip.AddrPort) (known bool, id hashing.Hash, max uint64, err error)
 	// Banned reports whether an address's range is banned; Punish bans it
 	// for sending invalid data.
 	Banned(addr netip.Addr) bool
 	Punish(addr netip.Addr)
 	// Import validates a pushed block. A returned *InvalidData proves the
-	// peer broke the rules.
+	// peer broke the rules; ErrHeld says the block was checked and is kept
+	// in memory until its branch overtakes the tip, which the peer is told
+	// as taken.
 	Import(raw []byte, from netip.AddrPort) (id hashing.Hash, known bool, err error)
 	// TxBound is the data capacity of the next block.
 	TxBound() uint64
@@ -50,6 +55,15 @@ type Backend interface {
 	Subscribe() (ch <-chan *Announcement, cancel func())
 	// Learned reports a peer's listening address from its hello.
 	Learned(addr netip.AddrPort)
+}
+
+// ErrHeld is returned by Import for a block held, not stored.
+var ErrHeld = errors.New("block held")
+
+// connCloser is a Backend that is told when an inbound connection ends, to
+// let go what it held for it.
+type connCloser interface {
+	Closed(from netip.AddrPort)
 }
 
 // ErrNotFound answers a request for something the node does not serve.
@@ -71,20 +85,50 @@ type Server struct {
 	// IPv4 address or IPv6 /64.
 	MaxInbound  int
 	MaxPerRange int
+	// Panicked, when set, is told of a panic recovered in a connection's
+	// handling, with its stack.
+	Panicked func(task string, v any, stack []byte)
 
 	mu    sync.Mutex
 	conns map[*serverConn]struct{}
+	// next numbers connections in the order they were taken; deliveries
+	// counts the new blocks inbound peers delivered, by which the latest
+	// deliveries are known.
+	next       uint64
+	deliveries uint64
+	// took is when each network group last took a connection's place, while
+	// that is less than settle ago.
+	took map[string]time.Time
 }
 
 type serverConn struct {
 	nc    net.Conn
 	addr  netip.AddrPort
 	rng   string
+	net   string
+	local bool
+	key   uint64
 	since time.Time
+	// block is when the peer last delivered a new block, as the count of
+	// deliveries then; 0 if never.
+	block uint64
 	wmu   sync.Mutex
 	// listen is the listening address the peer announced in its hello.
 	listen *netip.AddrPort
 }
+
+// Inbound policy (reference node, wiki: node/sync).
+const (
+	// protectedDeliverers is how many of the latest peers to deliver a new
+	// block keep their place in a full node whatever else.
+	protectedDeliverers = 4
+	// settle is how long a new connection in a full node keeps its place,
+	// so that a new node has the time to say hello and ask for addresses;
+	// and how long the network group of one that took another's place takes
+	// no other's, so that one address or a few networks cannot keep the
+	// newest place changing hands.
+	settle = 10 * time.Second
+)
 
 func (s *Server) log() *slog.Logger {
 	if s.Log == nil {
@@ -95,14 +139,8 @@ func (s *Server) log() *slog.Logger {
 
 // Serve accepts connections until ctx ends.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	if s.MaxInbound == 0 {
-		s.MaxInbound = 125
-	}
-	if s.MaxPerRange == 0 {
-		s.MaxPerRange = 8
-	}
 	s.mu.Lock()
-	s.conns = make(map[*serverConn]struct{})
+	s.init()
 	s.mu.Unlock()
 	go func() {
 		<-ctx.Done()
@@ -118,20 +156,65 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			if errors.As(err, &ne) && ne.Timeout() {
 				continue
 			}
+			// Out of files or memory for a moment: wait rather than end
+			// the listener, and with it every new peer, for good.
+			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ENOBUFS) ||
+				errors.Is(err, syscall.ENOMEM) || errors.Is(err, syscall.ECONNABORTED) {
+				s.log().Warn("accepting a peer connection", "err", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(time.Second):
+				}
+				continue
+			}
 			return err
 		}
 		ap, _ := netip.ParseAddrPort(nc.RemoteAddr().String())
 		ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
-		sc := &serverConn{nc: nc, addr: ap, rng: rangeOf(ap.Addr()), since: time.Now()}
+		sc := newServerConn(nc, ap, time.Now())
 		if !s.admit(sc) {
 			nc.Close()
 			continue
 		}
 		go func() {
 			defer s.drop(sc)
+			// A fault in one connection's handling ends that connection,
+			// not the node.
+			defer func() {
+				if v := recover(); v != nil {
+					s.panicked("inbound peer "+sc.addr.String(), v)
+				}
+			}()
 			s.handle(ctx, sc)
 		}()
 	}
+}
+
+func (s *Server) panicked(task string, v any) {
+	if s.Panicked != nil {
+		s.Panicked(task, v, debug.Stack())
+		return
+	}
+	s.log().Error("a peer task panicked", "task", task, "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+}
+
+func (s *Server) init() {
+	if s.MaxInbound == 0 {
+		s.MaxInbound = 125
+	}
+	if s.MaxPerRange == 0 {
+		s.MaxPerRange = 8
+	}
+	if s.conns == nil {
+		s.conns = make(map[*serverConn]struct{})
+		s.took = make(map[string]time.Time)
+	}
+}
+
+func newServerConn(nc net.Conn, ap netip.AddrPort, now time.Time) *serverConn {
+	return &serverConn{nc: nc, addr: ap, rng: rangeOf(ap.Addr()), net: networkOf(ap.Addr()),
+		local: local(ap.Addr()), since: now}
 }
 
 // rangeOf names an IPv4 address or IPv6 /64.
@@ -143,49 +226,188 @@ func rangeOf(a netip.Addr) string {
 	return p.String()
 }
 
+// networkOf names what inbound connections give way by: a public address's
+// network group (an IPv4 /16, an IPv6 /32), and a local one's range.
+func networkOf(a netip.Addr) string {
+	a = a.Unmap()
+	if !a.IsValid() || a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || !a.IsGlobalUnicast() {
+		return rangeOf(a)
+	}
+	bits := 32
+	if a.Is4() {
+		if o := a.As4(); o[0] == 100 && o[1]&0xc0 == 64 { // carrier-grade NAT
+			return rangeOf(a)
+		}
+		bits = 16
+	}
+	p, _ := a.Prefix(bits)
+	return p.String()
+}
+
 func local(a netip.Addr) bool { return a.IsLoopback() }
 
-// admit applies bans and connection limits. With every slot taken, a new
-// connection replaces the newest of the range holding the most, if that
-// range holds at least two more than the newcomer's.
+// settled reports whether another connection may take c's place at now.
+// This machine's own connections are its operator's, and need no time.
+func (c *serverConn) settled(now time.Time) bool {
+	return c.local || now.Sub(c.since) >= settle
+}
+
+// admit applies bans and connection limits: a connection is taken under its
+// range's share, and with every slot taken, in place of a settled one,
+// unless its network group took another's place less than settle ago. That
+// is the newest connection of the network holding the most, if that network
+// holds at least two more than the newcomer's, so that many addresses of one
+// network cannot hold every slot; otherwise the one least worth keeping. A
+// connection from this machine is held to neither the share nor the wait.
 func (s *Server) admit(sc *serverConn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.init()
 	if s.Backend.Banned(sc.addr.Addr()) {
 		return false
 	}
-	perRange := map[string][]*serverConn{}
+	ranged := 0
 	for c := range s.conns {
-		perRange[c.rng] = append(perRange[c.rng], c)
+		if c.rng == sc.rng {
+			ranged++
+		}
 	}
-	if !local(sc.addr.Addr()) && len(perRange[sc.rng]) >= s.MaxPerRange {
+	if ranged >= s.MaxPerRange && !sc.local {
 		return false
 	}
 	if len(s.conns) >= s.MaxInbound {
-		var big []*serverConn
-		for _, cs := range perRange {
-			if len(cs) > len(big) {
-				big = cs
+		now := sc.since
+		for n, at := range s.took {
+			if now.Sub(at) >= settle {
+				delete(s.took, n)
 			}
 		}
-		if len(big) < len(perRange[sc.rng])+2 {
+		if _, ok := s.took[sc.net]; ok && !sc.local {
 			return false
 		}
-		newest := big[0]
-		for _, c := range big {
-			if c.since.After(newest.since) {
-				newest = c
-			}
+		leaving := s.crowded(sc, now)
+		if leaving == nil {
+			leaving = s.leastUseful(sc.local, now)
 		}
-		newest.nc.Close()
-		delete(s.conns, newest)
+		if leaving == nil {
+			return false
+		}
+		leaving.nc.Close()
+		delete(s.conns, leaving)
+		if !sc.local {
+			s.took[sc.net] = now
+		}
 	}
+	s.next++
+	sc.key = s.next
 	s.conns[sc] = struct{}{}
 	return true
 }
 
+// crowded is the newest settled connection of the network holding the most,
+// if that network holds at least two more than the newcomer's. Called with
+// s.mu held.
+func (s *Server) crowded(sc *serverConn, now time.Time) *serverConn {
+	held := map[string]int{}
+	for c := range s.conns {
+		held[c.net]++
+	}
+	var largest string
+	most := 0
+	for n, k := range held {
+		if k > most || (k == most && n > largest) {
+			largest, most = n, k
+		}
+	}
+	if most <= held[sc.net]+1 {
+		return nil
+	}
+	var newest *serverConn
+	for c := range s.conns {
+		if c.net == largest && c.settled(now) && (newest == nil || c.key > newest.key) {
+			newest = c
+		}
+	}
+	return newest
+}
+
+// leastUseful is the connection least worth keeping, after Bitcoin's
+// eviction: this machine's own (unless the newcomer is local too), the
+// latest to deliver new blocks, and of the rest the longest connected half
+// are kept; of the settled others the newest of the network holding the most
+// gives way, and of networks holding as many, the one whose newest is
+// newest. None while every connection is kept. Called with s.mu held.
+func (s *Server) leastUseful(newcomerLocal bool, now time.Time) *serverConn {
+	var rest []*serverConn
+	for c := range s.conns {
+		if newcomerLocal || !c.local {
+			rest = append(rest, c)
+		}
+	}
+	sort.Slice(rest, func(i, j int) bool { return rest[i].key < rest[j].key }) // oldest first
+	latest := make([]*serverConn, 0, len(rest))
+	for _, c := range rest {
+		if c.block > 0 {
+			latest = append(latest, c)
+		}
+	}
+	sort.Slice(latest, func(i, j int) bool { return latest[i].block > latest[j].block })
+	if len(latest) > protectedDeliverers {
+		latest = latest[:protectedDeliverers]
+	}
+	kept := map[*serverConn]bool{}
+	for _, c := range latest {
+		kept[c] = true
+	}
+	others := rest[:0:0]
+	for _, c := range rest {
+		if !kept[c] {
+			others = append(others, c)
+		}
+	}
+	type group struct {
+		count  int
+		newest *serverConn
+	}
+	held := map[string]*group{}
+	for _, c := range others[len(others)/2:] {
+		if c.settled(now) {
+			g := held[c.net]
+			if g == nil {
+				g = &group{}
+				held[c.net] = g
+			}
+			g.count++
+			g.newest = c // others is oldest first
+		}
+	}
+	var worst *group
+	for _, g := range held {
+		if worst == nil || g.count > worst.count || (g.count == worst.count && g.newest.key > worst.newest.key) {
+			worst = g
+		}
+	}
+	if worst == nil {
+		return nil
+	}
+	return worst.newest
+}
+
+// delivered records that sc delivered a block this node did not have. A
+// transaction counts for nothing: one is pooled without being executed, so
+// delivering one costs nothing.
+func (s *Server) delivered(sc *serverConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deliveries++
+	sc.block = s.deliveries
+}
+
 func (s *Server) drop(sc *serverConn) {
 	sc.nc.Close()
+	if b, ok := s.Backend.(connCloser); ok {
+		b.Closed(sc.addr)
+	}
 	s.mu.Lock()
 	delete(s.conns, sc)
 	s.mu.Unlock()
@@ -226,6 +448,9 @@ func (sc *serverConn) write(p []byte) error {
 	sc.nc.SetWriteDeadline(time.Now().Add(FrameTimeout))
 	return WriteFrame(sc.nc, p)
 }
+
+// maxRequest bounds a request's frame: the largest carries one slice.
+const maxRequest = MaxSlice + 4<<10
 
 // readRequest waits up to the idle limit for a frame's length, then five
 // seconds for its bytes.
@@ -313,6 +538,12 @@ func (s *Server) handle(ctx context.Context, sc *serverConn) {
 		ch, stop := s.Backend.Subscribe()
 		defer stop()
 		go func() {
+			defer func() {
+				if v := recover(); v != nil {
+					s.panicked("announcements to "+sc.addr.String(), v)
+					cancel()
+				}
+			}()
 			for {
 				select {
 				case <-cctx.Done():
@@ -332,7 +563,7 @@ func (s *Server) handle(ctx context.Context, sc *serverConn) {
 	b := &bucket{tokens: unitsBurst, last: time.Now()}
 	var pending *push
 	for cctx.Err() == nil {
-		p, err := readRequest(sc.nc, MaxFrame, IdleLimit)
+		p, err := readRequest(sc.nc, maxRequest, IdleLimit)
 		if err != nil {
 			return
 		}
@@ -379,8 +610,10 @@ func cost(m Message) float64 {
 // carried is what carrying n bytes of a block or transaction adds.
 func carried(n int) float64 { return float64((n + (64 << 10) - 1) / (64 << 10)) }
 
-// sliceCost is what a raw or transaction_raw answer adds once answered:
-// its slice's bytes.
+// sliceCost is what an answer adds once it is written: the bytes of a raw
+// or transaction_raw slice, and of the transactions a pending or deferred
+// answer carries, which count as a block's slices do. Without it a peer
+// could draw megabytes for the two units of the request.
 func sliceCost(m Message, ans []byte) float64 {
 	switch m.(type) {
 	case *RawRequest, *TransactionRawRequest:
@@ -389,6 +622,8 @@ func sliceCost(m Message, ans []byte) float64 {
 				return carried(len(sl.Bytes))
 			}
 		}
+	case *PendingRequest, *DeferredRequest:
+		return carried(len(ans))
 	}
 	return 0
 }
@@ -476,6 +711,14 @@ func (s *Server) pushSlice(sc *serverConn, tag byte, offset, total uint64, b []b
 				return EncodeError("invalid block: truncated header"), true, true
 			}
 			id, known, err = be.Import(raw, sc.addr)
+			switch {
+			case errors.Is(err, ErrHeld):
+				// Held blocks do not count as delivered: holding one
+				// executes nothing.
+				err = nil
+			case err == nil && !known:
+				s.delivered(sc)
+			}
 		} else {
 			id, known, err = be.Submit(raw, notBefore, sc.addr)
 		}
@@ -498,7 +741,7 @@ func (s *Server) pushSlice(sc *serverConn, tag byte, offset, total uint64, b []b
 			if len(b) < 294 {
 				return EncodeError("invalid block: truncated header"), true, true
 			}
-			known, id, max, err := be.CheckHeader(b[:294])
+			known, id, max, err := be.CheckHeader(b[:294], sc.addr)
 			if err != nil {
 				var inv *InvalidData
 				if errors.As(err, &inv) {

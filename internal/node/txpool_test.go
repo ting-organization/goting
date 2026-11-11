@@ -56,7 +56,8 @@ func TestTurns(t *testing.T) {
 		{ID: hashing.Hash{1}, Source: a}, {ID: hashing.Hash{2}, Source: a},
 		{ID: hashing.Hash{3}, Source: b}, {ID: hashing.Hash{4}, Source: a, Tried: 5},
 	}
-	// Untried first; the first of each address before the second of any.
+	// The first of each address before the second of any, whenever a
+	// template last ran them.
 	got := turns(pool, map[netip.Addr]uint64{})
 	want := []int{0, 2, 1, 3}
 	for i := range want {
@@ -64,10 +65,56 @@ func TestTurns(t *testing.T) {
 			t.Fatalf("order %v want %v", got, want)
 		}
 	}
-	// An address tried more recently waits behind the others.
-	got = turns(pool, map[netip.Addr]uint64{a: 7})
+	// A range that had its turn more recently waits behind the others.
+	got = turns(pool, map[netip.Addr]uint64{a: 7, b: 3})
 	if got[0] != 2 {
 		t.Fatalf("order %v", got)
+	}
+	// A range not yet in the queue comes after those that are.
+	got = turns(pool, map[netip.Addr]uint64{a: 7})
+	if got[0] != 0 {
+		t.Fatalf("order %v", got)
+	}
+}
+
+// The addresses of one IPv6 /64, which one subscriber holds whole, share one
+// place: in the pool's shares, the deferred set's cap and the turns.
+func TestSharesCountByRange(t *testing.T) {
+	v6 := func(i int) netip.Addr {
+		return netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb9, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, byte(i >> 8), byte(i)})
+	}
+	// Four transactions of one IPv4 address and four of a /64, each from its
+	// own address: a fifth address of the /64 takes nobody's place.
+	pool := pooled("10.0.0.1", 4)
+	for i := 0; i < 4; i++ {
+		pool = append(pool, &Pooled{ID: hashing.Hash{9, byte(i)}, Source: v6(i)})
+	}
+	if at := fairShare(pool, v6(100)); at != -1 {
+		t.Fatalf("an address of a full /64 took a place: %d", at)
+	}
+	// Another range does: the newest of the range holding the most.
+	if at := fairShare(pool, addr("10.0.0.2")); at != 7 {
+		t.Fatalf("gave way at %d", at)
+	}
+	// In templates the /64 has one turn, not one per address.
+	got := turns(pool, map[netip.Addr]uint64{})
+	if got[0] != 0 || got[1] != 4 || got[2] != 1 || got[3] != 5 {
+		t.Fatalf("order %v", got)
+	}
+	// The deferred set's cap of 256 counts the /64 together.
+	n := newTestNode(t, Config{})
+	budget := types.ResourceVector{1000, 10, 1000, 0}
+	later := now() + 3600
+	for i := 0; i < DeferredPerSource; i++ {
+		if _, err := n.Submit(callTx(hashing.Hash{1, byte(i >> 8), byte(i)}, nil, budget), &later, v6(i), true); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	if _, err := n.Submit(callTx(hashing.Hash{2}, nil, budget), &later, v6(5000), true); err != ErrDeferredFull {
+		t.Fatalf("a /64 passed its share of the deferred set: %v", err)
+	}
+	if _, err := n.Submit(callTx(hashing.Hash{3}, nil, budget), &later, addr("10.0.0.2"), true); err != nil {
+		t.Fatal(err)
 	}
 }
 

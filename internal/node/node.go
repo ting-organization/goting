@@ -3,8 +3,10 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -71,6 +73,7 @@ type Node struct {
 	tipChanged chan struct{}
 	snapMu     sync.Mutex
 	peers      *Peers
+	probing    atomic.Bool // the locks are being tried after a panic
 
 	// Templates kept for solutions; guarded by tx.mu.
 	templates []*miner.Template
@@ -139,7 +142,15 @@ func (n *Node) pruneIndex() {
 }
 
 func (n *Node) unindexLocked(block hashing.Hash, ib indexedBlock) {
+	// Each list is filtered once, however often the block names its
+	// program or transaction: a block of one transaction a thousand times
+	// would otherwise cost a thousand passes.
+	seenC := make(map[hashing.Hash]bool, len(ib.contracts))
 	for _, c := range ib.contracts {
+		if seenC[c] {
+			continue
+		}
+		seenC[c] = true
 		kept := n.events[c][:0]
 		for _, p := range n.events[c] {
 			if p.Block != block {
@@ -152,7 +163,12 @@ func (n *Node) unindexLocked(block hashing.Hash, ib indexedBlock) {
 			n.events[c] = kept
 		}
 	}
+	seenT := make(map[hashing.Hash]bool, len(ib.txs))
 	for _, id := range ib.txs {
+		if seenT[id] {
+			continue
+		}
+		seenT[id] = true
 		locs := n.occ[id][:0]
 		for _, l := range n.occ[id] {
 			if l.Block != block {
@@ -294,6 +310,52 @@ func (n *Node) canonical(height uint64, block hashing.Hash) bool {
 	return ok && e.ID == block
 }
 
+// livenessWait is how long the node's locks may stay taken after a panic
+// before the node gives up. exit ends the process; a variable for tests.
+var (
+	livenessWait = 60 * time.Second
+	osExit       = os.Exit
+	exit         = osExit
+)
+
+// panicked records a panic recovered in one of the node's tasks. A fault in
+// handling one peer or request should end that connection, not the node;
+// but a panic that left one of the node's locks held would leave it hanging
+// with its listeners up, which is worse than stopping: a supervisor starts
+// a stopped node again. So the locks are tried, and if one is still taken
+// after livenessWait the process exits.
+func (n *Node) panicked(task string, v any, stack []byte) {
+	n.log.Error("a task panicked", "task", task, "panic", fmt.Sprint(v), "stack", string(stack))
+	if !n.probing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer n.probing.Store(false)
+		free := make(chan struct{})
+		go func() {
+			n.Chain.Tip()
+			n.PoolLen()
+			n.mu.RLock()
+			n.mu.RUnlock() //nolint:staticcheck // taken only to see that it can be
+			if p := n.peers; p != nil {
+				p.mu.Lock()
+				p.mu.Unlock() //nolint:staticcheck
+				p.book.Len()
+				if p.server != nil {
+					p.server.Inbound()
+				}
+			}
+			close(free)
+		}()
+		select {
+		case <-free:
+		case <-time.After(livenessWait):
+			n.log.Error("a lock is still held after a panic: the node cannot go on and exits, to be started again")
+			exit(2)
+		}
+	}()
+}
+
 // PeerInfo lists peer connections.
 func (n *Node) PeerInfo() []PeerInfo {
 	if n.peers == nil {
@@ -307,7 +369,11 @@ func (n *Node) PeerInfo() []PeerInfo {
 // RelayEcho included it at all.
 func (n *Node) recentlyIncluded(id hashing.Hash) bool {
 	tip := n.Chain.Tip().Height
-	for _, l := range n.Occurrences(id) {
+	var from uint64
+	if tip >= RelayRecent {
+		from = tip - RelayRecent + 1
+	}
+	for _, l := range n.occurrencesFrom(id, from) {
 		if l.Height+RelayRecent > tip && l.Status == types.StatusSuccess {
 			return true
 		}
@@ -320,7 +386,7 @@ func (n *Node) recentlyIncluded(id hashing.Hash) bool {
 
 // succeededAbove reports a successful canonical inclusion above height.
 func (n *Node) succeededAbove(id hashing.Hash, height uint64) bool {
-	for _, l := range n.Occurrences(id) {
+	for _, l := range n.occurrencesFrom(id, height) {
 		if l.Height > height && l.Status == types.StatusSuccess {
 			return true
 		}
@@ -330,12 +396,20 @@ func (n *Node) succeededAbove(id hashing.Hash, height uint64) bool {
 
 // Occurrences returns where a transaction appears in the canonical chain,
 // lowest first.
-func (n *Node) Occurrences(id hashing.Hash) []Location {
+func (n *Node) Occurrences(id hashing.Hash) []Location { return n.occurrencesFrom(id, 0) }
+
+// occurrencesFrom lists the occurrences at height from and above.
+func (n *Node) occurrencesFrom(id hashing.Hash, from uint64) []Location {
 	n.mu.RLock()
-	out := append([]Location(nil), n.occ[id]...)
+	var out []Location
+	for _, l := range n.occ[id] {
+		if l.Height >= from {
+			out = append(out, l)
+		}
+	}
 	n.mu.RUnlock()
 	if d := n.Chain.Database(); d != nil {
-		rows, err := d.Occurrences(id)
+		rows, err := d.OccurrencesFrom(id, from)
 		if err != nil {
 			n.log.Error("occurrence index", "err", err)
 		}
@@ -415,21 +489,7 @@ func (n *Node) GetTx(id hashing.Hash) (raw []byte, deferred *Deferred, pooled bo
 // TxIDs returns ids in id order after after, at most limit, and whether more
 // follow: pooled ones leaving out deferred entries, or the deferred set.
 func (n *Node) TxIDs(deferred bool, after *hashing.Hash, limit int) ([]hashing.Hash, bool) {
-	n.tx.mu.Lock()
-	var all []hashing.Hash
-	if deferred {
-		for id := range n.tx.deferred {
-			all = append(all, id)
-		}
-	} else {
-		for id := range n.tx.byID {
-			if _, d := n.tx.deferred[id]; !d {
-				all = append(all, id)
-			}
-		}
-	}
-	n.tx.mu.Unlock()
-	sort.Slice(all, func(i, j int) bool { return lessID(all[i], all[j]) })
+	all := n.tx.sortedIDs(deferred)
 	start := 0
 	if after != nil {
 		start = sort.Search(len(all), func(i int) bool { return lessID(*after, all[i]) })
@@ -482,7 +542,20 @@ func (n *Node) SubmitBlock(raw []byte) (*chain.Entry, error) {
 	return n.SubmitBlockFrom(raw, "")
 }
 
-// SubmitBlockFrom is SubmitBlock for a block a peer pushed.
+// SubmitPushed takes a block a peer pushed unasked.
+func (n *Node) SubmitPushed(raw []byte, peer string) (*chain.Entry, error) {
+	e, err := n.Chain.ProcessPushed(raw, peer)
+	var sc *chain.SeedConformanceError
+	if errors.As(err, &sc) {
+		n.log.Error("stopping: seed conformance fault", "err", sc)
+		if n.Fatal != nil {
+			n.Fatal(sc)
+		}
+	}
+	return e, err
+}
+
+// SubmitBlockFrom is SubmitBlock for a block a peer delivered on request.
 func (n *Node) SubmitBlockFrom(raw []byte, peer string) (*chain.Entry, error) {
 	e, err := n.Chain.ProcessBlockFrom(raw, peer)
 	var sc *chain.SeedConformanceError
@@ -604,13 +677,20 @@ func (n *Node) Template(explicit []hashing.Hash) (*miner.Template, error) {
 		p.mu.Lock()
 		p.turn++
 		turn := p.turn
+		// A range that left the pool is forgotten and joins at the back
+		// when it returns; a new one joins behind those already waiting.
 		inPool := map[netip.Addr]bool{}
 		for _, it := range p.items {
-			inPool[it.Source] = true
+			inPool[sourceRange(it.Source)] = true
 		}
 		for s := range p.sources {
 			if !inPool[s] {
 				delete(p.sources, s)
+			}
+		}
+		for s := range inPool {
+			if _, ok := p.sources[s]; !ok {
+				p.sources[s] = turn - 1
 			}
 		}
 		pool := append([]*Pooled(nil), p.items...)
@@ -620,11 +700,18 @@ func (n *Node) Template(explicit []hashing.Hash) (*miner.Template, error) {
 			if b.Spent() {
 				break
 			}
-			p.mu.Lock()
-			p.sources[pool[at].Source] = turn
-			p.mu.Unlock()
-			if _, err := b.Try(pool[at].Raw, pool[at].Tx); err != nil {
+			alone := b.Count() == 0
+			r, err := b.Try(pool[at].Raw, pool[at].Tx)
+			if err != nil {
 				return nil, err
+			}
+			// A range goes to the back when the template keeps one of its
+			// transactions or runs one into an empty block; one the block no
+			// longer fits, tried after others, keeps its place.
+			if r != nil || alone {
+				p.mu.Lock()
+				p.sources[sourceRange(pool[at].Source)] = turn
+				p.mu.Unlock()
 			}
 		}
 	}
