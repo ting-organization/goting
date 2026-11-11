@@ -13,7 +13,6 @@ import (
 	"runtime/debug"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -239,8 +238,15 @@ func resolveAll(s string, timeout time.Duration) ([]netip.AddrPort, error) {
 // and every minute while the book holds no seed address the node may
 // connect to, as when bans or failures cover them all, or the network was
 // down when the node started. Only the first lookup is logged.
+//
+// A seed's address is a seed's only while a seed name leads to it: a name
+// is used so that a seed can move, and the address it moved from may be
+// anyone's afterwards. Once every name has been looked up, the addresses
+// none of them gave are seeds' no more. While a name has yet to resolve in
+// this run, what it gave an earlier run is unknown, and nothing is retired.
 func (p *Peers) keepSeeds(ctx context.Context) {
 	first := true
+	found := map[string][]netip.AddrPort{}
 	for {
 		for _, name := range p.cfg.Seeds {
 			addrs, err := resolveAll(name, seedLookup)
@@ -250,6 +256,7 @@ func (p *Peers) keepSeeds(ctx context.Context) {
 				}
 				continue
 			}
+			found[name] = addrs
 			for _, a := range addrs {
 				p.mu.Lock()
 				self := p.selves[a] || p.own(a)
@@ -258,6 +265,18 @@ func (p *Peers) keepSeeds(ctx context.Context) {
 					p.book.AddSeed(a)
 				}
 			}
+		}
+		if len(found) == len(p.cfg.Seeds) {
+			var current []netip.AddrPort
+			for _, addrs := range found {
+				current = append(current, addrs...)
+			}
+			for _, a := range p.book.RetireSeeds(current) {
+				p.n.log.Info("no seed name leads to this address any more: a seed's no longer", "address", a.String())
+			}
+		}
+		if len(p.cfg.Seeds) == 0 {
+			return
 		}
 		first = false
 		wait := seedRefresh
@@ -370,7 +389,7 @@ func (p *Peers) Run(ctx context.Context) error {
 	wg.Add(2)
 	go forever("announcements", p.announceLoop)
 	go forever("connections", p.manage)
-	if p.cfg.Discovery && len(p.cfg.Seeds) > 0 {
+	if p.cfg.Discovery {
 		wg.Add(1)
 		go forever("seed lookup", p.keepSeeds)
 	}
@@ -478,6 +497,9 @@ func (p *Peers) manage(ctx context.Context) {
 		// keep room for nodes that are new.
 		var discovered, linked []*session
 		for _, s := range p.sessions {
+			// A link to an address that is a seed's no longer is a
+			// discovered peer's, and takes a slot as one.
+			s.seed = s.seed && p.book.IsSeed(s.addr)
 			if (!s.configured && p.book.Banned(s.addr.Addr())) || s.configured != isConfigured[s.addr] {
 				s.cancel()
 				continue
@@ -702,7 +724,13 @@ func (p *Peers) checked(s *session) (uint64, bool) {
 	if tip == nil {
 		return 0, false
 	}
-	e, ok := p.n.Chain.Get(*tip)
+	return p.holds(*tip)
+}
+
+// holds is the height of a header this node holds and has not found
+// invalid.
+func (p *Peers) holds(id hashing.Hash) (uint64, bool) {
+	e, ok := p.n.Chain.Get(id)
 	if !ok || p.n.Chain.StatusOf(e) == chain.StatusInvalid {
 		return 0, false
 	}
@@ -798,12 +826,15 @@ func (p *Peers) run(ctx context.Context, s *session) error {
 				s.lacking.Store(true)
 			}
 		},
+		Claimed: func() *hashing.Hash { return s.tip.Load() },
 		// Nothing past this node's own locator: the peer's tip is one of
-		// its entries, so an announced tip that is none of them, and that
-		// this node does not hold, is one the peer cannot show.
-		OnNoHeaders: func(locator []hashing.Hash) {
-			if tip := s.tip.Load(); tip != nil && !slices.Contains(locator, *tip) {
-				if _, ok := p.checked(s); !ok {
+		// its entries, so a tip it claimed before it was asked that is
+		// none of them, and that this node does not hold, is one the peer
+		// cannot show. A tip claimed since may be a block it took since,
+		// which this node has yet to ask for.
+		OnNoHeaders: func(locator []hashing.Hash, claimed *hashing.Hash) {
+			if claimed != nil && !slices.Contains(locator, *claimed) {
+				if _, ok := p.holds(*claimed); !ok {
 					s.lacking.Store(true)
 				}
 			}
@@ -1007,12 +1038,10 @@ func trim(m map[hashing.Hash]bool, listed map[hashing.Hash]bool, limit int) {
 	}
 }
 
-func wantsRoom(err error) bool {
-	if err == nil {
-		return false
-	}
-	text := err.Error()
-	return strings.Contains(text, ErrPoolFull.Error()) || strings.Contains(text, ErrDeferredFull.Error())
+// lacksRoom reports whether this node refused a transaction for want of
+// room; p2p.NoRoom is the same of a peer's answer.
+func lacksRoom(err error) bool {
+	return errors.Is(err, ErrPoolFull) || errors.Is(err, ErrDeferredFull)
 }
 
 // poolLoop compares pools with the peer, pending and deferred: it fetches
@@ -1138,7 +1167,7 @@ func (p *Peers) exchange(ctx context.Context, r *relay, conn *p2p.Conn, deferred
 		if err != nil && !errors.As(err, &ea) {
 			return err
 		}
-		r.sent[id] = wantsRoom(err)
+		r.sent[id] = p2p.NoRoom(err)
 	}
 	trim(r.sent, mine, limit)
 	return nil
@@ -1189,7 +1218,7 @@ func (p *Peers) fetchItems(ctx context.Context, r *relay, conn *p2p.Conn, deferr
 			return errNotAsked
 		}
 		_, err := p.n.Submit(raw, it.NotBefore, source, true)
-		r.fetched[it.ID] = wantsRoom(err)
+		r.fetched[it.ID] = lacksRoom(err)
 	}
 	// What the peer listed and did not give, or gave too large to take, is
 	// not asked for again either.

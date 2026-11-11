@@ -3,9 +3,11 @@ package p2p
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/ting-organization/goting/internal/chain"
 	"github.com/ting-organization/goting/internal/hashing"
 )
 
@@ -89,5 +91,36 @@ func TestStrictDecoding(t *testing.T) {
 	ea, ok := err.(*ErrorAnswer)
 	if !ok || len(ea.Text) > MaxErrorText || !strings.HasPrefix(long, ea.Text) {
 		t.Fatalf("error text: %v", err)
+	}
+}
+
+// The error texts a node acts on are the reference node's, word for word
+// (its node/src/chain.rs and peers.rs): reworded here, relay and sync
+// between versions change with no other test noticing.
+func TestErrorTextsNodesActOn(t *testing.T) {
+	for text, want := range map[string]string{
+		TextBlockNotFound:    "block not found",
+		TextNoCommonAncestor: "no common ancestor",
+		TextPoolFull:         "mempool is full",
+		TextDeferredFull:     "deferred set is full",
+	} {
+		if text != want {
+			t.Fatalf("%q is %q in the reference", text, want)
+		}
+	}
+	if chain.ErrNoCommonAncestor.Error() != TextNoCommonAncestor {
+		t.Fatal("the chain's error is what a headers request is answered")
+	}
+	answer := func(text string) error {
+		_, err := DecodeAnswer(EncodeError(text))
+		return err
+	}
+	if !NoRoom(answer(TextPoolFull)) || !NoRoom(answer(TextDeferredFull)) {
+		t.Fatal("a full pool or deferred set is want of room")
+	}
+	// Only the peer's own answer counts, and only those two.
+	if NoRoom(nil) || NoRoom(answer("transaction already included")) || NoRoom(answer("the mempool is full of it")) ||
+		NoRoom(errors.New(TextPoolFull)) {
+		t.Fatal("refusals that are not for want of room")
 	}
 }

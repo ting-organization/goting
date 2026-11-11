@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ting-organization/goting/internal/hashing"
+	"github.com/ting-organization/goting/internal/p2p"
 )
 
 // One address announcing many ports, or one network many addresses, takes
@@ -44,7 +45,7 @@ func TestOneAddressOrNetworkCannotTakeOverTheBook(t *testing.T) {
 	}
 	inGroup := 0
 	for _, e := range b.Entries() {
-		if g, _ := group(e.Address.Addr()); g == "20.20.0.0/16" {
+		if g, _ := p2p.Group(e.Address.Addr()); g == "20.20.0.0/16" {
 			inGroup++
 		}
 	}
@@ -90,7 +91,7 @@ func TestSameAddressesForAnHour(t *testing.T) {
 		}
 	}
 	// An hour on, the answer is drawn again.
-	b.shared[reachPublic].drawn -= shareKept
+	b.shared[p2p.ReachPublic].drawn -= shareKept
 	if got := b.Share(ip("5.5.5.5"), nil); slices.Equal(got, first) {
 		t.Fatal("the same 32 of 200 were drawn twice")
 	}
@@ -335,8 +336,15 @@ func TestRelayOnceAConnection(t *testing.T) {
 	if _, ok := r.fetched[b]; !ok {
 		t.Fatal("retried again at the same tip")
 	}
-	if !wantsRoom(ErrPoolFull) || !wantsRoom(ErrDeferredFull) || wantsRoom(ErrIncluded) || wantsRoom(nil) {
+	if !lacksRoom(ErrPoolFull) || !lacksRoom(ErrDeferredFull) || lacksRoom(ErrIncluded) || lacksRoom(nil) {
 		t.Fatal("refusals for want of room")
+	}
+	// What this node answers a peer when full is what a peer takes as
+	// want of room.
+	for _, full := range []error{ErrPoolFull, ErrDeferredFull} {
+		if _, err := p2p.DecodeAnswer(p2p.EncodeError(full.Error())); !p2p.NoRoom(err) {
+			t.Fatalf("%v is not want of room to a peer", full)
+		}
 	}
 	// The sorted listings are reused for a moment, then made anew.
 	n := newTestNode(t, Config{})
@@ -350,5 +358,54 @@ func TestRelayOnceAConnection(t *testing.T) {
 	ids2, _ := n.TxIDs(false, nil, 10)
 	if len(ids1) != 0 || len(ids2) != 1 || !bytes.Equal(ids2[0][:], ids2[0][:]) {
 		t.Fatalf("listings %d then %d", len(ids1), len(ids2))
+	}
+}
+
+// A seed's address is a seed's while a seed name leads to it. One the names
+// left becomes an address a peer told of: it gives way, can be banned, and
+// takes a slot, so whoever holds it afterwards has no standing.
+func TestSeedAddressANameLeftIsRetired(t *testing.T) {
+	b := NewAddressBook("")
+	stays, moved, banned := ap("8.8.8.8:18442"), ap("9.9.9.9:18442"), ap("7.7.7.7:18442")
+	configured := ap("6.6.6.6:18442")
+	b.Configure([]netip.AddrPort{configured})
+	for _, a := range []netip.AddrPort{stays, moved, banned} {
+		b.AddSeed(a)
+	}
+	// A seed is kept through a ban.
+	b.Ban(banned.Addr())
+	if !b.IsSeed(banned) {
+		t.Fatal("a banned seed was dropped")
+	}
+	retired := b.RetireSeeds([]netip.AddrPort{stays})
+	if !slices.Equal(retired, []netip.AddrPort{banned, moved}) {
+		t.Fatalf("retired %v", retired)
+	}
+	if !b.IsSeed(stays) || b.IsSeed(moved) || !slices.Equal(b.Seeds(), []netip.AddrPort{stays}) {
+		t.Fatalf("seeds: %v", b.Seeds())
+	}
+	source := map[netip.AddrPort]AddrSource{}
+	for _, e := range b.Entries() {
+		source[e.Address] = e.Source
+	}
+	if source[moved] != SourcePeer || source[configured] != SourceConfig {
+		t.Fatalf("sources: %v", source)
+	}
+	if _, kept := source[banned]; kept {
+		t.Fatal("a banned address that is a seed's no longer was kept")
+	}
+	// As any discovered address, it now goes with a ban of its range.
+	b.Ban(moved.Addr())
+	for _, e := range b.Entries() {
+		if e.Address == moved {
+			t.Fatal("a retired seed address outlived a ban")
+		}
+	}
+	// The same names again retire nothing; with no names, none is left.
+	if again := b.RetireSeeds([]netip.AddrPort{stays}); len(again) != 0 {
+		t.Fatalf("retired again: %v", again)
+	}
+	if b.RetireSeeds(nil); len(b.Seeds()) != 0 {
+		t.Fatal("seeds without a name")
 	}
 }

@@ -227,21 +227,12 @@ func rangeOf(a netip.Addr) string {
 }
 
 // networkOf names what inbound connections give way by: a public address's
-// network group (an IPv4 /16, an IPv6 /32), and a local one's range.
+// network group, and a local one's range.
 func networkOf(a netip.Addr) string {
-	a = a.Unmap()
-	if !a.IsValid() || a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || !a.IsGlobalUnicast() {
-		return rangeOf(a)
+	if g, ok := Group(a); ok {
+		return g
 	}
-	bits := 32
-	if a.Is4() {
-		if o := a.As4(); o[0] == 100 && o[1]&0xc0 == 64 { // carrier-grade NAT
-			return rangeOf(a)
-		}
-		bits = 16
-	}
-	p, _ := a.Prefix(bits)
-	return p.String()
+	return rangeOf(a.Unmap())
 }
 
 func local(a netip.Addr) bool { return a.IsLoopback() }
@@ -653,7 +644,7 @@ func (s *Server) answer(sc *serverConn, m Message, pending **push) ([]byte, bool
 	case *RawRequest:
 		raw, err := be.Block(r.ID)
 		if err != nil {
-			return EncodeError("block not found"), false, false
+			return EncodeError(TextBlockNotFound), false, false
 		}
 		return sliceAnswer(raw, r.Offset, r.Length), false, false
 	case *TransactionRawRequest:

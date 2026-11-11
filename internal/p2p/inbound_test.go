@@ -3,6 +3,7 @@ package p2p
 import (
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,8 +144,44 @@ func TestAnswersAreChargedByTheirBytes(t *testing.T) {
 	if c := sliceCost(&StateRequest{}, big); c != 0 {
 		t.Fatalf("state: %v", c)
 	}
-	if maxAnswer(&RawRequest{Length: 1000}) > 2000 || maxAnswer(&StateRequest{}) > 64<<10 ||
+	if maxAnswer(&RawRequest{Length: 100000}) > 101000 || maxAnswer(&StateRequest{}) > 64<<10 ||
 		maxAnswer(&AddressesRequest{}) > 8<<10 {
 		t.Fatal("answer bounds")
+	}
+	// An error answer fits every bound, also that of a block's last few
+	// bytes.
+	longest := len(EncodeError(strings.Repeat("x", 2*MaxErrorText)))
+	for _, req := range []Message{&RawRequest{Length: 1}, &TransactionRawRequest{Length: 1}, &StateRequest{},
+		&HeadersRequest{}, &InventoryRequest{}, &AddressesRequest{}, &Import{}, &Submit{}, &PendingRequest{},
+		&DeferredRequest{}} {
+		if most := maxAnswer(req); most < longest {
+			t.Fatalf("%T: an error answer of %d bytes is over the bound of %d", req, longest, most)
+		}
+	}
+}
+
+// Inbound connections give way by the network group the address book
+// counts its shares by, and addresses with no group by their range.
+func TestInboundAndBookAgreeOnNetworks(t *testing.T) {
+	for _, s := range []string{"8.8.8.8", "20.20.1.1", "2a01:4f8:1:2::3", "::ffff:8.8.4.4"} {
+		a := netip.MustParseAddr(s)
+		g, ok := Group(a)
+		if !ok || networkOf(a) != g {
+			t.Fatalf("%s: group %q (%v), inbound network %q", s, g, ok, networkOf(a))
+		}
+	}
+	if g, _ := Group(netip.MustParseAddr("20.20.1.1")); g != "20.20.0.0/16" {
+		t.Fatal(g)
+	}
+	if g, _ := Group(netip.MustParseAddr("2a01:4f8:1:2::3")); g != "2a01:4f8::/32" {
+		t.Fatal(g)
+	}
+	// Private, carrier-grade NAT, loopback and documentation addresses
+	// have no group: each range stands for itself.
+	for _, s := range []string{"10.1.2.3", "100.64.1.1", "127.0.0.1", "192.0.2.7", "fd00::1", "2001:db8::1"} {
+		a := netip.MustParseAddr(s)
+		if _, ok := Group(a); ok || networkOf(a) != rangeOf(a) {
+			t.Fatalf("%s: inbound network %q", s, networkOf(a))
+		}
 	}
 }

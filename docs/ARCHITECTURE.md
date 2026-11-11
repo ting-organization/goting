@@ -328,7 +328,11 @@ reach is given the same `addresses` answer for an hour.
 
 The seeds are where a node starts, not peers to keep. Their names are looked
 up again every hour, their addresses stay in the book through a ban, and
-links to them take none of the `max_peers` slots. A node leaves them once its
+links to them take none of the `max_peers` slots. An address is a seed's only
+while a name leads to it: once every name has been looked up, the ones none of
+them gave become addresses a peer told of, so that whoever holds an address a
+seed moved from has no standing (the reference keeps such an address a seed's
+for good). A node leaves them once its
 tip is within a block of its best header, it holds a seed's tip, and half of
 `max_peers` other peers are at tips as high as its best header and have not
 been caught lacking a block they claimed. It comes back when fewer than a

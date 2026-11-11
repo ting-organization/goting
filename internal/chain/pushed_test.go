@@ -48,7 +48,7 @@ func TestPushedSiblingIsHeldUntilItsBranchOvertakes(t *testing.T) {
 	if h, s, _ := c.Counts(); h != headers || s != stored {
 		t.Fatalf("a held block changed the index or the store: %d headers, %d stored", h, s)
 	}
-	if bytes, runs := c.HeldBytes(); bytes != len(side[0]) || runs != 1 {
+	if runs, _, bytes := c.Held(); bytes != len(side[0]) || runs != 1 {
 		t.Fatalf("held %d bytes in %d runs", bytes, runs)
 	}
 	// Pushed again it is known, and costs nothing more.
@@ -68,7 +68,7 @@ func TestPushedSiblingIsHeldUntilItsBranchOvertakes(t *testing.T) {
 	if c.Tip() != e || c.Tip().Height != 4 || !c.IsCanonical(e.Parent) {
 		t.Fatalf("tip at height %d", c.Tip().Height)
 	}
-	if bytes, runs := c.HeldBytes(); bytes != 0 || runs != 0 {
+	if runs, _, bytes := c.Held(); bytes != 0 || runs != 0 {
 		t.Fatalf("still holding %d bytes in %d runs", bytes, runs)
 	}
 }
@@ -85,7 +85,7 @@ func TestHeldRunGoesWithItsConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.ReleasePushed("a")
-	if bytes, runs := c.HeldBytes(); bytes != 0 || runs != 0 {
+	if runs, _, bytes := c.Held(); bytes != 0 || runs != 0 {
 		t.Fatalf("held %d bytes in %d runs after the connection ended", bytes, runs)
 	}
 	if _, err := c.ProcessPushed(side[1], "a"); !errors.Is(err, chain.ErrUnknownParent) {
@@ -124,7 +124,7 @@ func TestPusherMovesWithinItsRun(t *testing.T) {
 	if _, err := c.ProcessPushed(cs[0], "a"); !errors.Is(err, chain.ErrHeld) {
 		t.Fatalf("moving within the run: %v", err)
 	}
-	if bytes, _ := c.HeldBytes(); bytes != len(b[0])+len(cs[0]) {
+	if _, _, bytes := c.Held(); bytes != len(b[0])+len(cs[0]) {
 		t.Fatalf("the run was not cut back: %d bytes", bytes)
 	}
 	if _, err := c.ProcessPushed(cs[1], "a"); !errors.Is(err, chain.ErrHeld) {
@@ -261,5 +261,38 @@ func TestPresyncIndexesOnlyWhatStillOvertakes(t *testing.T) {
 	res, _ := c.HeadersFrom("p", hs)
 	if n, _, _ := c.Counts(); res.Indexed != 0 || n != before {
 		t.Fatalf("a branch the best header passed was indexed: %+v", res)
+	}
+}
+
+// A run grows where it is kept, while the status page counts what is held
+// and other connections end: run under the race detector.
+func TestHeldIsReadWhileARunGrows(t *testing.T) {
+	c := newChain(t, nil)
+	g := c.Genesis()
+	mineEmpty(t, c, 6, g.GenesisTimestamp, 60, "main")
+	other := forkOf(t, c, 2)
+	side := mineEmpty(t, other, 3, g.GenesisTimestamp+120, 60, "side")
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.Held()
+				c.ReleasePushed("another")
+			}
+		}
+	}()
+	for _, raw := range side {
+		if _, err := c.ProcessPushed(raw, "a"); !errors.Is(err, chain.ErrHeld) {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	<-done
+	if runs, blocks, _ := c.Held(); runs != 1 || blocks != len(side) {
+		t.Fatalf("held %d blocks in %d runs", blocks, runs)
 	}
 }

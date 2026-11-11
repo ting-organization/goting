@@ -19,6 +19,8 @@ type fakeBackend struct {
 	imported [][]byte
 	ann      chan *Announcement
 	punished []netip.Addr
+	// headers, when set, answers headers requests.
+	headers func(loc []hashing.Hash) ([][]byte, error)
 }
 
 func (f *fakeBackend) ChainID() hashing.Hash { return f.chain }
@@ -27,6 +29,9 @@ func (f *fakeBackend) State() *State {
 		Locator: []hashing.Hash{{1}}}
 }
 func (f *fakeBackend) Headers(loc []hashing.Hash) ([][]byte, error) {
+	if f.headers != nil {
+		return f.headers(loc)
+	}
 	return nil, errors.New("no common ancestor")
 }
 func (f *fakeBackend) Block(id hashing.Hash) ([]byte, error) {

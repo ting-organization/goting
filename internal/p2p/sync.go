@@ -41,9 +41,14 @@ type Syncer struct {
 	// OnAnnounce sees the peer's announcements; OnMissing is told when the
 	// peer says it does not have a block it was asked for; OnNoHeaders when
 	// it shows no headers past this node's own locator.
-	OnAnnounce  func(a *Announcement)
-	OnMissing   func()
-	OnNoHeaders func(locator []hashing.Hash)
+	OnAnnounce func(a *Announcement)
+	OnMissing  func()
+	// Claimed, when set, is the tip the peer last said it is at. It is read
+	// before a headers request is sent and given to OnNoHeaders with the
+	// answer: the peer held that tip when it answered, whereas a tip it
+	// announces while the answer is on its way may be one it took since.
+	Claimed     func() *hashing.Hash
+	OnNoHeaders func(locator []hashing.Hash, claimed *hashing.Hash)
 	// next is where the next headers request continues.
 	next *hashing.Hash
 	// retry is when a block the peer said it does not have may be asked of
@@ -144,9 +149,13 @@ func (s *Syncer) headers(ctx context.Context, c *Conn) (bool, error) {
 		if s.next != nil {
 			locator = []hashing.Hash{*s.next}
 		}
+		var claimed *hashing.Hash
+		if s.Claimed != nil {
+			claimed = s.Claimed()
+		}
 		m, err := c.Do(ctx, &HeadersRequest{Locator: locator})
 		var ea *ErrorAnswer
-		if errors.As(err, &ea) && ea.Text == "no common ancestor" && s.next != nil {
+		if errors.As(err, &ea) && ea.Text == TextNoCommonAncestor && s.next != nil {
 			// The peer moved off the header its answer was to follow.
 			s.next = nil
 			continue
@@ -160,7 +169,7 @@ func (s *Syncer) headers(ctx context.Context, c *Conn) (bool, error) {
 		}
 		if len(hs.Headers) == 0 {
 			if s.next == nil && s.OnNoHeaders != nil {
-				s.OnNoHeaders(locator)
+				s.OnNoHeaders(locator, claimed)
 			}
 			s.next = nil
 			return false, nil
@@ -267,7 +276,7 @@ func (s *Syncer) blocks(ctx context.Context, c *Conn) (int, error) {
 			ahead -= d.asked
 			raw, err := s.collect(ctx, c, d)
 			var ea *ErrorAnswer
-			if errors.As(err, &ea) && ea.Text == "block not found" {
+			if errors.As(err, &ea) && ea.Text == TextBlockNotFound {
 				// The peer does not have it: the others are asked at once,
 				// and this one again in a moment.
 				for _, q := range queue {

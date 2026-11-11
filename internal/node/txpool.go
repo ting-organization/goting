@@ -15,6 +15,7 @@ import (
 	"github.com/ting-organization/goting/internal/chain"
 	"github.com/ting-organization/goting/internal/exec"
 	"github.com/ting-organization/goting/internal/hashing"
+	"github.com/ting-organization/goting/internal/p2p"
 	"github.com/ting-organization/goting/internal/types"
 	"github.com/ting-organization/goting/internal/vm"
 )
@@ -48,8 +49,8 @@ const (
 
 // Refusals, with the reference node's texts.
 var (
-	ErrPoolFull     = errors.New("mempool is full")
-	ErrDeferredFull = errors.New("deferred set is full")
+	ErrPoolFull     = errors.New(p2p.TextPoolFull)
+	ErrDeferredFull = errors.New(p2p.TextDeferredFull)
 	ErrHorizon      = errors.New("not_before is more than a year ahead")
 	ErrTooLarge     = errors.New("transaction larger than the data capacity")
 	ErrIncluded     = errors.New("transaction already included")

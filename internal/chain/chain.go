@@ -834,17 +834,9 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 			return nil, false, err
 		}
 	}
-	if uint64(len(raw)) > e.Vote.Limits[types.D] {
-		return e, false, mismatch(h, id, "block of %d bytes exceeds D capacity %d", len(raw), e.Vote.Limits[types.D])
-	}
-	body, err := types.DecodeBody(raw[types.HeaderSize:])
+	body, err := checkBody(h, id, raw, e.Vote.Limits[types.D])
 	if err != nil {
-		return e, false, mismatch(h, id, "%v", err)
-	}
-	if types.ProducerHash(body.ProducerData) != h.ProducerHash ||
-		commit.TransactionsRoot(body.Transactions) != h.TransactionsRoot ||
-		commit.ReceiptsRoot(body.Receipts) != h.ReceiptsRoot {
-		return e, false, mismatch(h, id, "body commitment mismatch")
+		return e, false, err
 	}
 	e = c.indexHeader(e)
 	if err := c.store.Put(id, raw); err != nil {
@@ -862,6 +854,25 @@ func (c *Chain) acceptBlock(raw []byte, recovered bool) (*Entry, bool, error) {
 	c.advanceFrontier()
 	c.mu.Unlock()
 	return e, false, nil
+}
+
+// checkBody checks a block's bytes against its header, as far as storing or
+// holding it needs: within the data capacity that bounds it, a body that
+// decodes, and the three roots the header commits to.
+func checkBody(h *types.Header, id hashing.Hash, raw []byte, limit uint64) (*types.Body, error) {
+	if uint64(len(raw)) > limit {
+		return nil, mismatch(h, id, "block of %d bytes exceeds D capacity %d", len(raw), limit)
+	}
+	body, err := types.DecodeBody(raw[types.HeaderSize:])
+	if err != nil {
+		return nil, mismatch(h, id, "%v", err)
+	}
+	if types.ProducerHash(body.ProducerData) != h.ProducerHash ||
+		commit.TransactionsRoot(body.Transactions) != h.TransactionsRoot ||
+		commit.ReceiptsRoot(body.Receipts) != h.ReceiptsRoot {
+		return nil, mismatch(h, id, "body commitment mismatch")
+	}
+	return body, nil
 }
 
 // markComplete records that e has data; it and every descendant with data

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"math/big"
 
-	"github.com/ting-organization/goting/internal/commit"
 	"github.com/ting-organization/goting/internal/consensus"
 	"github.com/ting-organization/goting/internal/hashing"
 	"github.com/ting-organization/goting/internal/types"
@@ -188,17 +187,8 @@ func (c *Chain) checkPushed(w *walk, h *types.Header, id hashing.Hash, raw []byt
 	if raw == nil {
 		return nil
 	}
-	if uint64(len(raw)) > vs.Limits[types.D] {
-		return mismatch(h, id, "block of %d bytes exceeds D capacity %d", len(raw), vs.Limits[types.D])
-	}
-	body, err := types.DecodeBody(raw[types.HeaderSize:])
-	if err != nil {
-		return mismatch(h, id, "%v", err)
-	}
-	if types.ProducerHash(body.ProducerData) != h.ProducerHash ||
-		commit.TransactionsRoot(body.Transactions) != h.TransactionsRoot ||
-		commit.ReceiptsRoot(body.Receipts) != h.ReceiptsRoot {
-		return mismatch(h, id, "body commitment mismatch")
+	if _, err := checkBody(h, id, raw, vs.Limits[types.D]); err != nil {
+		return err
 	}
 	return nil
 }
@@ -219,24 +209,33 @@ func (c *Chain) hold(peer string, run *heldRun, h *types.Header, id hashing.Hash
 		c.dropRun(peer, ErrBehind)
 		return nil, ErrBehind
 	}
-	run.blocks = append(run.blocks, heldBlock{id: id, h: h, raw: append([]byte(nil), raw...)})
+	// The run may be the one the connection already has, which Held and
+	// the count of all runs read under c.mu.
+	kept := heldBlock{id: id, h: h, raw: append([]byte(nil), raw...)}
+	c.mu.Lock()
+	run.blocks = append(run.blocks, kept)
 	run.bytes += len(raw)
 	run.walk = w
-	c.setRun(peer, run)
-	c.mu.RLock()
+	c.keepRun(peer, run)
 	tipWork := c.tip.ChainWork
-	c.mu.RUnlock()
+	c.mu.Unlock()
 	if !exceeds(w.work, consensus.Work(h.Target), tipWork) {
 		return nil, ErrHeld
 	}
 	return c.storeRun(peer, run)
 }
 
-// setRun makes run the connection's, and makes room among all runs: the
-// largest other one gives way. Called with processMu held.
+// setRun is keepRun for a caller that holds processMu only.
 func (c *Chain) setRun(peer string, run *heldRun) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.keepRun(peer, run)
+}
+
+// keepRun makes run the connection's, and makes room among all runs: the
+// largest other one gives way. A run is changed only with both locks held,
+// so either lets it be read. Called with processMu and c.mu held.
+func (c *Chain) keepRun(peer string, run *heldRun) {
 	if old := c.runs[peer]; old != nil && run.goneErr == nil {
 		run.gone, run.goneErr = old.gone, old.goneErr
 	}
@@ -297,22 +296,15 @@ func (c *Chain) ReleasePushed(peer string) {
 	c.countRuns()
 }
 
-// Held is the number of pushed blocks held in memory and their size.
-func (c *Chain) Held() (blocks, bytes int) {
+// Held is what the node holds of pushed blocks in memory: the connections
+// with a run, the blocks in them, and their size.
+func (c *Chain) Held() (runs, blocks, bytes int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, r := range c.runs {
 		blocks += len(r.blocks)
 	}
-	return blocks, c.runBytes
-}
-
-// HeldBytes is the size of the pushed blocks held in memory, and the
-// number of connections holding some.
-func (c *Chain) HeldBytes() (bytes, runs int) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.runBytes, len(c.runs)
+	return len(c.runs), blocks, c.runBytes
 }
 
 // storeRun stores a run that overtakes the tip, parents first, each block

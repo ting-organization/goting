@@ -71,3 +71,27 @@ func TestNodeLeavesTheSeedsAndComesBack(t *testing.T) {
 	stopOther()
 	waitFor(t, "the new node to come back to the seed", func() bool { return linked(seedAddr) })
 }
+
+// An address a seed name led to in an earlier run, and leads to no longer,
+// is retired once the names have been looked up.
+func TestRunRetiresSeedAddressesTheNamesLeft(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+	c, _ := chain.New(types.DevelopmentGenesis(), chain.NoSeed, chain.NewMemStore(), chain.DefaultConfig())
+	n := New(c, Config{}, log)
+	// Ports of this machine that nothing listens on.
+	now, earlier := ap("127.0.0.1:9"), ap("127.0.0.1:1")
+	p := NewPeers(n, PeerConfig{Listen: "127.0.0.1:0", Discovery: true, Seeds: []string{now.String()}})
+	p.Book().AddSeed(earlier)
+	wg.Add(2)
+	go func() { defer wg.Done(); n.Run(ctx) }()
+	go func() { defer wg.Done(); p.Run(ctx) }()
+	waitFor(t, "the earlier address to be retired", func() bool {
+		return p.Book().IsSeed(now) && !p.Book().IsSeed(earlier)
+	})
+}

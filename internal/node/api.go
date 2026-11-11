@@ -491,7 +491,7 @@ func (n *Node) Status() map[string]any {
 			undoPruned = floor
 		}
 	}
-	heldBlocks, heldBytes := c.Held()
+	_, heldBlocks, heldBytes := c.Held()
 	return map[string]any{"name": n.cfg.Name, "version": Version, "network": n.network(),
 		"chain_id": c.ChainID(), "genesis": c.GenesisID(), "height": tip.Height, "tip": tip.ID,
 		"work": tip.ChainWork.String(), "state_root": root, "limits": n.nextLimits(),

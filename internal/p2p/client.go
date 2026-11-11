@@ -235,9 +235,9 @@ func maxAnswer(req Message) int {
 	const framing = 4 << 10 // tags, counts, an agent, an error's text
 	switch r := req.(type) {
 	case *RawRequest:
-		return int(r.Length) + sliceFraming
+		return max(int(r.Length)+sliceFraming, framing)
 	case *TransactionRawRequest:
-		return int(r.Length) + sliceFraming
+		return max(int(r.Length)+sliceFraming, framing)
 	case *StateRequest:
 		return framing + 32*(MaxLocator+2*MaxPoolIDs)
 	case *HeadersRequest:

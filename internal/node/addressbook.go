@@ -8,6 +8,8 @@ import (
 	"slices"
 	"sort"
 	"sync"
+
+	"github.com/ting-organization/goting/internal/p2p"
 )
 
 // Peer discovery policy (reference node, wiki: node/sync). Not consensus.
@@ -59,63 +61,21 @@ type BookEntry struct {
 	Failures uint32 `json:"failures"`
 }
 
-type reach int
-
-const (
-	reachUnusable reach = iota
-	reachLoopback
-	reachPrivate
-	reachPublic
-)
-
-func reachOf(a netip.Addr) reach {
-	a = a.Unmap()
-	switch {
-	case !a.IsValid() || a.IsUnspecified() || a.IsMulticast():
-		return reachUnusable
-	case a.Is4():
-		o := a.As4()
-		if o == [4]byte{255, 255, 255, 255} || (o[0] == 192 && o[1] == 0 && o[2] == 2) ||
-			(o[0] == 198 && o[1] == 51 && o[2] == 100) || (o[0] == 203 && o[1] == 0 && o[2] == 113) {
-			return reachUnusable
-		}
-		if a.IsLoopback() {
-			return reachLoopback
-		}
-		if a.IsPrivate() || a.IsLinkLocalUnicast() || (o[0] == 100 && o[1]&0xc0 == 64) {
-			return reachPrivate
-		}
-		return reachPublic
-	default:
-		b := a.As16()
-		if b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8 {
-			return reachUnusable
-		}
-		if a.IsLoopback() {
-			return reachLoopback
-		}
-		if b[0]&0xfe == 0xfc || (b[0] == 0xfe && b[1]&0xc0 == 0x80) {
-			return reachPrivate
-		}
-		return reachPublic
-	}
-}
-
 func usable(a netip.AddrPort) bool {
-	return a.Port() != 0 && reachOf(a.Addr()) != reachUnusable
+	return a.Port() != 0 && p2p.ReachOf(a.Addr()) != p2p.ReachUnusable
 }
 
 // shareable reports whether a may be shared with, or accepted from, a peer
 // at peer: public addresses with anyone, private ones only off the public
 // internet, loopback ones only on the same machine.
 func shareable(a netip.AddrPort, peer netip.Addr) bool {
-	switch reachOf(a.Addr()) {
-	case reachPublic:
+	switch p2p.ReachOf(a.Addr()) {
+	case p2p.ReachPublic:
 		return true
-	case reachPrivate:
-		return reachOf(peer) != reachPublic
-	case reachLoopback:
-		return reachOf(peer) == reachLoopback
+	case p2p.ReachPrivate:
+		return p2p.ReachOf(peer) != p2p.ReachPublic
+	case p2p.ReachLoopback:
+		return p2p.ReachOf(peer) == p2p.ReachLoopback
 	}
 	return false
 }
@@ -131,22 +91,6 @@ func banKey(a netip.Addr) netip.Addr {
 		b[i] = 0
 	}
 	return netip.AddrFrom16(b)
-}
-
-// group is the network group of a public address (an IPv4 /16, an IPv6
-// /32), from which a node keeps at most one discovered peer. Local
-// addresses have none.
-func group(a netip.Addr) (string, bool) {
-	a = a.Unmap()
-	if reachOf(a) != reachPublic {
-		return "", false
-	}
-	bits := 32
-	if a.Is4() {
-		bits = 16
-	}
-	p, _ := a.Prefix(bits)
-	return p.String(), true
 }
 
 func canon(a netip.AddrPort) netip.AddrPort {
@@ -181,7 +125,7 @@ type AddressBook struct {
 	banned  map[netip.Addr]uint64
 	// shared is the addresses answer for peers of each reach; added, by
 	// network group, how many addresses it added this hour.
-	shared map[reach]*shared
+	shared map[p2p.Reach]*shared
 	added  map[string]*added
 	path   string
 	dirty  bool
@@ -194,7 +138,7 @@ type AddressBook struct {
 // proven, then the least failed.
 func NewAddressBook(path string) *AddressBook {
 	b := &AddressBook{entries: map[netip.AddrPort]*BookEntry{}, banned: map[netip.Addr]uint64{},
-		shared: map[reach]*shared{}, added: map[string]*added{}, path: path}
+		shared: map[p2p.Reach]*shared{}, added: map[string]*added{}, path: path}
 	if path == "" {
 		return b
 	}
@@ -308,7 +252,7 @@ func (b *AddressBook) AddAnnounced(a netip.AddrPort) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	t := now()
-	g, public := group(a.Addr())
+	g, public := p2p.Group(a.Addr())
 	if public && !b.mayAdd(g, t) {
 		return false
 	}
@@ -328,7 +272,7 @@ func (b *AddressBook) AddShared(addrs []netip.AddrPort, from netip.Addr) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	t := now()
-	g, public := group(from)
+	g, public := p2p.Group(from)
 	n := 0
 	for i, a := range addrs {
 		if i == ShareMax || (public && !b.mayAdd(g, t)) {
@@ -362,6 +306,35 @@ func (b *AddressBook) AddSeed(a netip.AddrPort) {
 	if usable(a) {
 		b.insert(a, SourceSeed)
 	}
+}
+
+// RetireSeeds makes current the seed nodes' addresses: any other seed
+// address becomes one a peer told of, kept within the shares of its IP
+// address and network group and under the bans as such, or dropped where
+// those have no room for it. It returns the addresses retired.
+func (b *AddressBook) RetireSeeds(current []netip.AddrPort) []netip.AddrPort {
+	keep := map[netip.AddrPort]bool{}
+	for _, a := range current {
+		keep[canon(a)] = true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var retired []netip.AddrPort
+	for a, e := range b.entries {
+		if e.Source == SourceSeed && !keep[a] {
+			retired = append(retired, a)
+		}
+	}
+	sort.Slice(retired, func(i, j int) bool { return retired[i].Compare(retired[j]) < 0 })
+	for _, a := range retired {
+		if b.isBanned(a.Addr()) || !b.fits(a) {
+			delete(b.entries, a)
+		} else {
+			b.entries[a].Source = SourcePeer
+		}
+		b.dirty = true
+	}
+	return retired
 }
 
 // IsSeed reports whether an address is a seed node's.
@@ -403,7 +376,7 @@ func (b *AddressBook) SeedDue() bool {
 // network group leave room for it. Local addresses have no share: they come
 // only from this machine or its own network.
 func (b *AddressBook) fits(a netip.AddrPort) bool {
-	own, public := group(a.Addr())
+	own, public := p2p.Group(a.Addr())
 	if !public {
 		return true
 	}
@@ -412,7 +385,7 @@ func (b *AddressBook) fits(a netip.AddrPort) bool {
 		if !e.discovered() {
 			continue
 		}
-		if g, ok := group(e.Address.Addr()); ok && g == own {
+		if g, ok := p2p.Group(e.Address.Addr()); ok && g == own {
 			sameGroup++
 			if e.Address.Addr() == a.Addr() {
 				sameIP++
@@ -426,13 +399,13 @@ func (b *AddressBook) fits(a netip.AddrPort) bool {
 // group if either is full: the least worth keeping of that address or group
 // gives way, never a proven one. It reports whether there is room.
 func (b *AddressBook) makeRoom(a netip.AddrPort) bool {
-	own, public := group(a.Addr())
+	own, public := p2p.Group(a.Addr())
 	if !public {
 		return true
 	}
 	sameIP := func(e *BookEntry) bool { return e.Address.Addr() == a.Addr() }
 	sameGroup := func(e *BookEntry) bool {
-		g, ok := group(e.Address.Addr())
+		g, ok := p2p.Group(e.Address.Addr())
 		return ok && g == own
 	}
 	if b.held(sameIP) >= perIP && !b.giveWay(sameIP, false) {
@@ -625,7 +598,7 @@ func (b *AddressBook) Pick(want int, busy map[netip.AddrPort]bool) []netip.AddrP
 	defer b.mu.Unlock()
 	groups := map[string]bool{}
 	for a := range busy {
-		if g, ok := group(a.Addr()); ok {
+		if g, ok := p2p.Group(a.Addr()); ok {
 			groups[g] = true
 		}
 	}
@@ -657,7 +630,7 @@ func (b *AddressBook) Pick(want int, busy map[netip.AddrPort]bool) []netip.AddrP
 		if len(out) == want {
 			break
 		}
-		if g, ok := group(e.Address.Addr()); ok {
+		if g, ok := p2p.Group(e.Address.Addr()); ok {
 			if groups[g] {
 				continue
 			}
@@ -708,7 +681,7 @@ func (b *AddressBook) Share(asker netip.Addr, own *netip.AddrPort) []netip.AddrP
 		}
 		fresh = append(fresh, e.Address)
 	}
-	r := reachOf(asker)
+	r := p2p.ReachOf(asker)
 	kept := b.shared[r]
 	if kept != nil && (t < kept.drawn || t-kept.drawn >= shareKept) {
 		kept = nil
